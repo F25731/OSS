@@ -98,6 +98,20 @@ type ImageFilter struct {
 	KeyID string
 }
 
+const adminPageSize = 20
+
+type Pagination struct {
+	Page       int
+	PageSize   int
+	PrevPage   int
+	NextPage   int
+	HasPrev    bool
+	HasNext    bool
+	FirstURL   string
+	PrevURL    string
+	NextURL    string
+}
+
 type Stats struct {
 	ImageCount int64
 	TotalBytes int64
@@ -517,11 +531,6 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	logs, err := s.listUploadLogs(ctx, 10)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	renderAdmin(w, "overview", map[string]any{
 		"Stats":         stats,
 		"Recent":        recent,
@@ -531,28 +540,33 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		"CleanupRuns":   s.cleanupRuns.Load(),
 		"CleanupErrors": s.cleanupErrors.Load(),
 		"APIKeyCount":   len(keys),
-		"Logs":          logs,
 	})
 }
 
 func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
+	page := pageFromRequest(r)
 	filter := ImageFilter{
 		Query: r.URL.Query().Get("q"),
 		From:  r.URL.Query().Get("from"),
 		To:    r.URL.Query().Get("to"),
 		KeyID: r.URL.Query().Get("key_id"),
 	}
-	images, err := s.searchImages(r.Context(), filter, 100)
+	images, err := s.searchImages(r.Context(), filter, adminPageSize+1, (page-1)*adminPageSize)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	hasNext := len(images) > adminPageSize
+	if hasNext {
+		images = images[:adminPageSize]
+	}
+	pagination := buildPagination(r, page, adminPageSize, hasNext)
 	keys, err := s.listAPIKeys(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	renderAdmin(w, "images", map[string]any{"Images": images, "Filter": filter, "Keys": keys})
+	renderAdmin(w, "images", map[string]any{"Images": images, "Filter": filter, "Keys": keys, "Pagination": pagination})
 }
 
 func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
@@ -632,12 +646,18 @@ func (s *Server) handleAPIKeyDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
-	logs, err := s.listUploadLogs(r.Context(), 200)
+	page := pageFromRequest(r)
+	logs, err := s.listUploadLogs(r.Context(), adminPageSize+1, (page-1)*adminPageSize)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	renderAdmin(w, "logs", map[string]any{"Logs": logs})
+	hasNext := len(logs) > adminPageSize
+	if hasNext {
+		logs = logs[:adminPageSize]
+	}
+	pagination := buildPagination(r, page, adminPageSize, hasNext)
+	renderAdmin(w, "logs", map[string]any{"Logs": logs, "Pagination": pagination})
 }
 
 func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
@@ -702,6 +722,50 @@ func (s *Server) readStats(ctx context.Context) (Stats, error) {
 	return stats, err
 }
 
+func pageFromRequest(r *http.Request) int {
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		return 1
+	}
+	return page
+}
+
+func buildPagination(r *http.Request, page int, pageSize int, hasNext bool) Pagination {
+	if pageSize < 1 {
+		pageSize = adminPageSize
+	}
+	pagination := Pagination{
+		Page:       max(1, page),
+		PageSize:   pageSize,
+		PrevPage:   max(1, page-1),
+		NextPage:   page + 1,
+		HasPrev:    page > 1,
+		HasNext:    hasNext,
+	}
+	pagination.FirstURL = pageURL(r, 1)
+	if pagination.HasPrev {
+		pagination.PrevURL = pageURL(r, pagination.PrevPage)
+	}
+	if pagination.HasNext {
+		pagination.NextURL = pageURL(r, pagination.NextPage)
+	}
+	return pagination
+}
+
+func pageURL(r *http.Request, page int) string {
+	values := r.URL.Query()
+	if page <= 1 {
+		values.Del("page")
+	} else {
+		values.Set("page", strconv.Itoa(page))
+	}
+	query := values.Encode()
+	if query == "" {
+		return r.URL.Path
+	}
+	return r.URL.Path + "?" + query
+}
+
 func (s *Server) readSettings(ctx context.Context) (Settings, error) {
 	rows, err := s.db.Query(ctx, `select key, value from settings`)
 	if err != nil {
@@ -764,7 +828,7 @@ func (s *Server) recentImages(ctx context.Context, limit int) ([]ImageRecord, er
 	return items, rows.Err()
 }
 
-func (s *Server) searchImages(ctx context.Context, filter ImageFilter, limit int) ([]ImageRecord, error) {
+func (s *Server) imageFilterWhere(filter ImageFilter) ([]string, []any) {
 	where := []string{"deleted_at is null"}
 	args := []any{}
 	if q := strings.TrimSpace(filter.Query); q != "" {
@@ -787,9 +851,16 @@ func (s *Server) searchImages(ctx context.Context, filter ImageFilter, limit int
 		args = append(args, keyID)
 		where = append(where, fmt.Sprintf("api_key_id = $%d", len(args)))
 	}
+	return where, args
+}
+
+func (s *Server) searchImages(ctx context.Context, filter ImageFilter, limit int, offset int) ([]ImageRecord, error) {
+	where, args := s.imageFilterWhere(filter)
 	args = append(args, limit)
+	limitArg := len(args)
+	args = append(args, offset)
 	query := fmt.Sprintf(`select id, public_path, file_path, original_name, size_bytes, mime_type, sha256, coalesce(api_key_id, ''), api_key_name, created_at
-		from images where %s order by created_at desc limit $%d`, strings.Join(where, " and "), len(args))
+		from images where %s order by created_at desc limit $%d offset $%d`, strings.Join(where, " and "), limitArg, len(args))
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -1064,9 +1135,9 @@ func (s *Server) listAPIKeys(ctx context.Context) ([]APIKey, error) {
 	return items, rows.Err()
 }
 
-func (s *Server) listUploadLogs(ctx context.Context, limit int) ([]UploadLog, error) {
+func (s *Server) listUploadLogs(ctx context.Context, limit int, offset int) ([]UploadLog, error) {
 	rows, err := s.db.Query(ctx, `select id, coalesce(image_id, ''), coalesce(api_key_id, ''), api_key_name, original_name, size_bytes, mime_type, ip, user_agent, status, message, created_at
-		from upload_logs order by created_at desc limit $1`, limit)
+		from upload_logs order by created_at desc limit $1 offset $2`, limit, offset)
 	if err != nil {
 		return nil, err
 	}
@@ -1414,9 +1485,15 @@ form.inline{display:inline}
 button,.btn{border:0;border-radius:6px;background:#1769e0;color:#fff;padding:8px 12px;font-weight:700;cursor:pointer;text-decoration:none;display:inline-block}
 button.secondary,.btn.secondary{background:#eef3fb;color:#1f2a44}
 button.danger{background:#d93025}
+button[disabled]{opacity:.65;cursor:not-allowed}
 input,select{border:1px solid #cfd8e5;border-radius:6px;padding:8px 10px;font-size:14px;width:100%}
 label{display:block;font-size:12px;color:#536175;margin:8px 0 5px}
 .row{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;align-items:end}
+.section-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+.section-head h2{margin:0}
+.pager{display:flex;align-items:center;justify-content:flex-end;gap:10px;margin-top:14px;color:#65758b;font-size:13px}
+.pager .disabled{opacity:.45;pointer-events:none}
+.content>.grid+.card+.card{display:none}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{padding:10px;border-bottom:1px solid #e7edf5;text-align:left;vertical-align:middle}
 th{color:#536175;font-weight:700;background:#fafcff}
@@ -1453,6 +1530,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <section class="content">
 
 {{if eq .Page "overview"}}
+<div class="section-head"><h2>实时状态</h2><button type="button" class="secondary" data-refresh>刷新</button></div>
 <section class="grid">
 <div class="card"><div class="k">当前图片数</div><div class="v">{{.Stats.ImageCount}}</div></div>
 <div class="card"><div class="k">已用容量</div><div class="v">{{.TotalHuman}}</div></div>
@@ -1474,6 +1552,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 {{end}}
 
 {{if eq .Page "images"}}
+<div class="section-head"><h2>图片管理</h2><button type="button" class="secondary" data-refresh>刷新</button></div>
 <section class="card">
 <h2>搜索筛选</h2>
 <form method="get" action="/fyanxv/images" class="row">
@@ -1497,6 +1576,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 </section>
 {{end}}
 
+{{if and (eq .Page "images") .Pagination}}<div class="pager"><span>第 {{.Pagination.Page}} 页，每页 {{.Pagination.PageSize}} 条</span><a class="btn secondary {{if not .Pagination.HasPrev}}disabled{{end}}" href="{{.Pagination.FirstURL}}">第一页</a><a class="btn secondary {{if not .Pagination.HasPrev}}disabled{{end}}" href="{{.Pagination.PrevURL}}">上一页</a><a class="btn secondary {{if not .Pagination.HasNext}}disabled{{end}}" href="{{.Pagination.NextURL}}">下一页</a></div>{{end}}
 {{if eq .Page "api_keys"}}
 {{if .CreatedKey}}<div class="alert"><strong>新密钥已生成，只显示这一次：</strong><br><code>{{.CreatedKey}}</code></div>{{end}}
 <section class="card">
@@ -1518,6 +1598,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 {{end}}
 
 {{if eq .Page "logs"}}
+<div class="section-head"><h2>上传日志</h2><button type="button" class="secondary" data-refresh>刷新</button></div>
 <section class="card">
 <h2>上传日志</h2>
 <table><thead><tr><th>状态</th><th>文件</th><th>大小</th><th>类型</th><th>密钥</th><th>IP</th><th>信息</th><th>时间</th></tr></thead><tbody>
@@ -1526,6 +1607,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 </section>
 {{end}}
 
+{{if and (eq .Page "logs") .Pagination}}<div class="pager"><span>第 {{.Pagination.Page}} 页，每页 {{.Pagination.PageSize}} 条</span><a class="btn secondary {{if not .Pagination.HasPrev}}disabled{{end}}" href="{{.Pagination.FirstURL}}">第一页</a><a class="btn secondary {{if not .Pagination.HasPrev}}disabled{{end}}" href="{{.Pagination.PrevURL}}">上一页</a><a class="btn secondary {{if not .Pagination.HasNext}}disabled{{end}}" href="{{.Pagination.NextURL}}">下一页</a></div>{{end}}
 {{if eq .Page "docs"}}
 <section class="card">
 <h2>上传接口</h2>
@@ -1571,6 +1653,28 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 </section>
 </main>
 </div>
+<script>
+document.addEventListener("click", async function(event) {
+  const button = event.target.closest("[data-refresh]");
+  if (!button) return;
+  event.preventDefault();
+  const content = document.querySelector(".content");
+  if (!content) return;
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = "刷新中";
+  try {
+    const response = await fetch(window.location.href, {headers: {"X-Requested-With": "fetch"}});
+    const html = await response.text();
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const nextContent = doc.querySelector(".content");
+    if (nextContent) content.innerHTML = nextContent.innerHTML;
+  } finally {
+    button.disabled = false;
+    button.textContent = oldText || "刷新";
+  }
+});
+</script>
 </body>
 </html>`
 
