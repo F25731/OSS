@@ -1,0 +1,15 @@
+[Unit]
+Description=AI Image Bed
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ai-image-bed
+EnvironmentFile=/opt/ai-image-bed/.env
+ExecStart=/opt/ai-image-bed/image-bed
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

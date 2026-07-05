@@ -1,0 +1,31 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: imagebed
+      POSTGRES_USER: imagebed
+      POSTGRES_PASSWORD: imagebed
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U imagebed -d imagebed"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  image-bed:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - images:/data/image-bed/images
+
+volumes:
+  pgdata:
+  images:
