@@ -56,8 +56,46 @@ type ImageRecord struct {
 	SizeBytes    int64     `json:"sizeBytes"`
 	MimeType     string    `json:"mimeType"`
 	SHA256       string    `json:"sha256"`
+	APIKeyID     string    `json:"apiKeyId,omitempty"`
 	APIKeyName   string    `json:"apiKeyName"`
 	CreatedAt    time.Time `json:"createdAt"`
+}
+
+type APIKey struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	KeyHash   string    `json:"-"`
+	Prefix    string    `json:"prefix"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"createdAt"`
+	LastUsedAt time.Time `json:"lastUsedAt,omitempty"`
+}
+
+type UploadLog struct {
+	ID           int64     `json:"id"`
+	ImageID      string    `json:"imageId"`
+	APIKeyID     string    `json:"apiKeyId"`
+	APIKeyName   string    `json:"apiKeyName"`
+	OriginalName string    `json:"originalName"`
+	SizeBytes    int64     `json:"sizeBytes"`
+	MimeType      string    `json:"mimeType"`
+	IP            string    `json:"ip"`
+	UserAgent     string    `json:"userAgent"`
+	Status        string    `json:"status"`
+	Message       string    `json:"message"`
+	CreatedAt     time.Time `json:"createdAt"`
+}
+
+type UploadPrincipal struct {
+	ID   string
+	Name string
+}
+
+type ImageFilter struct {
+	Query string
+	From  string
+	To    string
+	KeyID string
 }
 
 type Stats struct {
@@ -149,6 +187,15 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /admin/login", s.handleLogin)
 	mux.HandleFunc("POST /admin/logout", s.requireAdmin(s.handleLogout))
 	mux.HandleFunc("GET /admin", s.requireAdmin(s.handleAdmin))
+	mux.HandleFunc("GET /admin/images", s.requireAdmin(s.handleImages))
+	mux.HandleFunc("POST /admin/images/delete", s.requireAdmin(s.handleImageDelete))
+	mux.HandleFunc("GET /admin/api-keys", s.requireAdmin(s.handleAPIKeys))
+	mux.HandleFunc("POST /admin/api-keys", s.requireAdmin(s.handleAPIKeyCreate))
+	mux.HandleFunc("POST /admin/api-keys/toggle", s.requireAdmin(s.handleAPIKeyToggle))
+	mux.HandleFunc("POST /admin/api-keys/delete", s.requireAdmin(s.handleAPIKeyDelete))
+	mux.HandleFunc("GET /admin/logs", s.requireAdmin(s.handleLogs))
+	mux.HandleFunc("GET /admin/docs", s.requireAdmin(s.handleDocs))
+	mux.HandleFunc("GET /admin/settings", s.requireAdmin(s.handleSettings))
 	mux.HandleFunc("POST /admin/settings", s.requireAdmin(s.handleSettingsUpdate))
 	mux.HandleFunc("POST /admin/cleanup", s.requireAdmin(s.handleCleanupNow))
 	mux.Handle("/i/", http.StripPrefix("/i/", http.FileServer(http.Dir(s.cfg.StorageDir))))
@@ -165,12 +212,41 @@ func (s *Server) migrate(ctx context.Context) error {
 			size_bytes bigint not null,
 			mime_type text not null,
 			sha256 text not null,
+			api_key_id text,
 			api_key_name text not null,
 			created_at timestamptz not null default now(),
 			deleted_at timestamptz
 		)`,
+		`alter table images add column if not exists api_key_id text`,
 		`create index if not exists images_active_created_at_idx on images (created_at) where deleted_at is null`,
 		`create index if not exists images_sha256_idx on images (sha256)`,
+		`create index if not exists images_api_key_id_idx on images (api_key_id) where deleted_at is null`,
+		`create table if not exists api_keys (
+			id text primary key,
+			name text not null,
+			key_hash text not null unique,
+			prefix text not null,
+			enabled boolean not null default true,
+			created_at timestamptz not null default now(),
+			last_used_at timestamptz
+		)`,
+		`create index if not exists api_keys_enabled_idx on api_keys (enabled)`,
+		`create table if not exists upload_logs (
+			id bigserial primary key,
+			image_id text,
+			api_key_id text,
+			api_key_name text not null default '',
+			original_name text not null default '',
+			size_bytes bigint not null default 0,
+			mime_type text not null default '',
+			ip text not null default '',
+			user_agent text not null default '',
+			status text not null,
+			message text not null default '',
+			created_at timestamptz not null default now()
+		)`,
+		`create index if not exists upload_logs_created_at_idx on upload_logs (created_at desc)`,
+		`create index if not exists upload_logs_api_key_id_idx on upload_logs (api_key_id)`,
 		`create table if not exists storage_stats (
 			id int primary key check (id = 1),
 			image_count bigint not null default 0,
@@ -200,6 +276,9 @@ func (s *Server) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.seedEnvAPIKeys(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -212,14 +291,16 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
-	keyName, ok := s.checkUploadAuth(r)
+	principal, ok := s.checkUploadAuth(r)
 	if !ok {
+		_ = s.writeUploadLog(r.Context(), UploadLog{IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: "密钥无效"})
 		writeJSON(w, http.StatusUnauthorized, 1, nil, "missing or invalid upload api key")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUploadBytes+1024*1024)
 	reader, err := r.MultipartReader()
 	if err != nil {
+		_ = s.writeUploadLog(r.Context(), UploadLog{APIKeyID: principal.ID, APIKeyName: principal.Name, IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: "请求必须是 multipart/form-data"})
 		writeJSON(w, http.StatusBadRequest, 1, nil, "expected multipart/form-data")
 		return
 	}
@@ -238,22 +319,25 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			_ = part.Close()
 			continue
 		}
-		uploaded, err = s.saveMultipartImage(r.Context(), part, keyName)
+		uploaded, err = s.saveMultipartImage(r.Context(), part, principal)
 		_ = part.Close()
 		if err != nil {
+			_ = s.writeUploadLog(r.Context(), UploadLog{APIKeyID: principal.ID, APIKeyName: principal.Name, OriginalName: part.FileName(), IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: err.Error()})
 			writeJSON(w, http.StatusBadRequest, 1, nil, err.Error())
 			return
 		}
 		break
 	}
 	if uploaded == nil {
+		_ = s.writeUploadLog(r.Context(), UploadLog{APIKeyID: principal.ID, APIKeyName: principal.Name, IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: "缺少 file 字段"})
 		writeJSON(w, http.StatusBadRequest, 1, nil, "multipart field file is required")
 		return
 	}
+	_ = s.writeUploadLog(r.Context(), UploadLog{ImageID: uploaded.ID, APIKeyID: uploaded.APIKeyID, APIKeyName: uploaded.APIKeyName, OriginalName: uploaded.OriginalName, SizeBytes: uploaded.SizeBytes, MimeType: uploaded.MimeType, IP: clientIP(r), UserAgent: r.UserAgent(), Status: "success", Message: uploaded.URL})
 	writeJSON(w, http.StatusOK, 0, uploaded, "ok")
 }
 
-func (s *Server) saveMultipartImage(ctx context.Context, part *multipart.Part, keyName string) (*ImageRecord, error) {
+func (s *Server) saveMultipartImage(ctx context.Context, part *multipart.Part, principal UploadPrincipal) (*ImageRecord, error) {
 	id := randomHex(16)
 	now := time.Now().UTC()
 	dateDir := filepath.Join(fmt.Sprintf("%04d", now.Year()), fmt.Sprintf("%02d", int(now.Month())), fmt.Sprintf("%02d", now.Day()))
@@ -327,7 +411,8 @@ func (s *Server) saveMultipartImage(ctx context.Context, part *multipart.Part, k
 		SizeBytes:    size,
 		MimeType:     mimeType,
 		SHA256:       hex.EncodeToString(hash.Sum(nil)),
-		APIKeyName:   keyName,
+		APIKeyID:     principal.ID,
+		APIKeyName:   principal.Name,
 		CreatedAt:    now,
 	}
 	if err := s.insertImage(ctx, record); err != nil {
@@ -345,11 +430,14 @@ func (s *Server) insertImage(ctx context.Context, img *ImageRecord) error {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	_, err = tx.Exec(ctx, `insert into images
-		(id, public_path, file_path, original_name, size_bytes, mime_type, sha256, api_key_name, created_at)
-		values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-		img.ID, img.PublicPath, img.FilePath, img.OriginalName, img.SizeBytes, img.MimeType, img.SHA256, img.APIKeyName, img.CreatedAt)
+		(id, public_path, file_path, original_name, size_bytes, mime_type, sha256, api_key_id, api_key_name, created_at)
+		values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		img.ID, img.PublicPath, img.FilePath, img.OriginalName, img.SizeBytes, img.MimeType, img.SHA256, img.APIKeyID, img.APIKeyName, img.CreatedAt)
 	if err != nil {
 		return err
+	}
+	if img.APIKeyID != "" {
+		_, _ = tx.Exec(ctx, `update api_keys set last_used_at = now() where id = $1`, img.APIKeyID)
 	}
 	_, err = tx.Exec(ctx, `update storage_stats set image_count = image_count + 1, total_bytes = total_bytes + $1, updated_at = now() where id = 1`, img.SizeBytes)
 	if err != nil {
@@ -384,16 +472,16 @@ func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/admin", http.StatusFound)
 		return
 	}
-	render(w, loginTemplate, map[string]any{"Error": ""})
+	render(w, loginTemplateV2, map[string]any{"Error": ""})
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		render(w, loginTemplate, map[string]any{"Error": "表单无效"})
+		render(w, loginTemplateV2, map[string]any{"Error": "表单无效"})
 		return
 	}
 	if r.FormValue("username") != s.cfg.AdminUser || r.FormValue("password") != s.cfg.AdminPassword {
-		render(w, loginTemplate, map[string]any{"Error": "用户名或密码错误"})
+		render(w, loginTemplateV2, map[string]any{"Error": "用户名或密码错误"})
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -418,21 +506,156 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	settings, err := s.readSettings(ctx)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	recent, err := s.recentImages(ctx, 20)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	render(w, adminTemplate, map[string]any{
+	keys, err := s.listAPIKeys(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	logs, err := s.listUploadLogs(ctx, 10)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	renderAdmin(w, "overview", map[string]any{
 		"Stats":         stats,
-		"Settings":      settings,
 		"Recent":        recent,
 		"TotalHuman":    formatBytes(stats.TotalBytes),
+		"MaxUpload":     formatBytes(s.cfg.MaxUploadBytes),
+		"PublicBaseURL": s.cfg.PublicBaseURL,
+		"CleanupRuns":   s.cleanupRuns.Load(),
+		"CleanupErrors": s.cleanupErrors.Load(),
+		"APIKeyCount":   len(keys),
+		"Logs":          logs,
+	})
+}
+
+func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
+	filter := ImageFilter{
+		Query: r.URL.Query().Get("q"),
+		From:  r.URL.Query().Get("from"),
+		To:    r.URL.Query().Get("to"),
+		KeyID: r.URL.Query().Get("key_id"),
+	}
+	images, err := s.searchImages(r.Context(), filter, 100)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	keys, err := s.listAPIKeys(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	renderAdmin(w, "images", map[string]any{"Images": images, "Filter": filter, "Keys": keys})
+}
+
+func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "表单无效", http.StatusBadRequest)
+		return
+	}
+	id := strings.TrimSpace(r.FormValue("id"))
+	if id == "" {
+		http.Error(w, "缺少图片 ID", http.StatusBadRequest)
+		return
+	}
+	if err := s.deleteImageByID(r.Context(), id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin/images", http.StatusFound)
+}
+
+func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request) {
+	keys, err := s.listAPIKeys(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	renderAdmin(w, "api_keys", map[string]any{
+		"Keys":       keys,
+		"CreatedKey": r.URL.Query().Get("created_key"),
+	})
+}
+
+func (s *Server) handleAPIKeyCreate(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "表单无效", http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		name = "未命名密钥"
+	}
+	raw := "ib_" + randomHex(24)
+	id := "key_" + randomHex(8)
+	_, err := s.db.Exec(r.Context(), `insert into api_keys (id, name, key_hash, prefix, enabled) values ($1,$2,$3,$4,true)`, id, name, hashAPIKey(raw), keyPrefix(raw))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin/api-keys?created_key="+raw, http.StatusFound)
+}
+
+func (s *Server) handleAPIKeyToggle(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "表单无效", http.StatusBadRequest)
+		return
+	}
+	id := strings.TrimSpace(r.FormValue("id"))
+	_, err := s.db.Exec(r.Context(), `update api_keys set enabled = not enabled where id = $1`, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin/api-keys", http.StatusFound)
+}
+
+func (s *Server) handleAPIKeyDelete(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "表单无效", http.StatusBadRequest)
+		return
+	}
+	id := strings.TrimSpace(r.FormValue("id"))
+	_, err := s.db.Exec(r.Context(), `delete from api_keys where id = $1`, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/admin/api-keys", http.StatusFound)
+}
+
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	logs, err := s.listUploadLogs(r.Context(), 200)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	renderAdmin(w, "logs", map[string]any{"Logs": logs})
+}
+
+func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
+	keys, err := s.listAPIKeys(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	renderAdmin(w, "docs", map[string]any{"PublicBaseURL": s.cfg.PublicBaseURL, "Keys": keys})
+}
+
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	settings, err := s.readSettings(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	renderAdmin(w, "settings", map[string]any{
+		"Settings":      settings,
 		"CapacityHuman": fmt.Sprintf("%d GB", settings.CapacityGB),
 		"MaxUpload":     formatBytes(s.cfg.MaxUploadBytes),
 		"PublicBaseURL": s.cfg.PublicBaseURL,
@@ -457,7 +680,7 @@ func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/admin", http.StatusFound)
+	http.Redirect(w, r, "/admin/settings", http.StatusFound)
 }
 
 func (s *Server) handleCleanupNow(w http.ResponseWriter, r *http.Request) {
@@ -467,7 +690,7 @@ func (s *Server) handleCleanupNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("manual cleanup: deleted=%d freed=%s", result.Deleted, formatBytes(result.FreedBytes))
-	http.Redirect(w, r, "/admin", http.StatusFound)
+	http.Redirect(w, r, "/admin/settings", http.StatusFound)
 }
 
 func (s *Server) readStats(ctx context.Context) (Stats, error) {
@@ -516,7 +739,7 @@ func (s *Server) saveSettings(ctx context.Context, settings Settings) error {
 }
 
 func (s *Server) recentImages(ctx context.Context, limit int) ([]ImageRecord, error) {
-	rows, err := s.db.Query(ctx, `select id, public_path, file_path, original_name, size_bytes, mime_type, sha256, api_key_name, created_at
+	rows, err := s.db.Query(ctx, `select id, public_path, file_path, original_name, size_bytes, mime_type, sha256, coalesce(api_key_id, ''), api_key_name, created_at
 		from images where deleted_at is null order by created_at desc limit $1`, limit)
 	if err != nil {
 		return nil, err
@@ -525,13 +748,73 @@ func (s *Server) recentImages(ctx context.Context, limit int) ([]ImageRecord, er
 	var items []ImageRecord
 	for rows.Next() {
 		var item ImageRecord
-		if err := rows.Scan(&item.ID, &item.PublicPath, &item.FilePath, &item.OriginalName, &item.SizeBytes, &item.MimeType, &item.SHA256, &item.APIKeyName, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.PublicPath, &item.FilePath, &item.OriginalName, &item.SizeBytes, &item.MimeType, &item.SHA256, &item.APIKeyID, &item.APIKeyName, &item.CreatedAt); err != nil {
 			return nil, err
 		}
 		item.URL = s.cfg.PublicBaseURL + item.PublicPath
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+func (s *Server) searchImages(ctx context.Context, filter ImageFilter, limit int) ([]ImageRecord, error) {
+	where := []string{"deleted_at is null"}
+	args := []any{}
+	if q := strings.TrimSpace(filter.Query); q != "" {
+		args = append(args, "%"+q+"%")
+		where = append(where, fmt.Sprintf("(original_name ilike $%d or id ilike $%d or sha256 ilike $%d)", len(args), len(args), len(args)))
+	}
+	if from := strings.TrimSpace(filter.From); from != "" {
+		if t, err := time.Parse("2006-01-02", from); err == nil {
+			args = append(args, t)
+			where = append(where, fmt.Sprintf("created_at >= $%d", len(args)))
+		}
+	}
+	if to := strings.TrimSpace(filter.To); to != "" {
+		if t, err := time.Parse("2006-01-02", to); err == nil {
+			args = append(args, t.Add(24*time.Hour))
+			where = append(where, fmt.Sprintf("created_at < $%d", len(args)))
+		}
+	}
+	if keyID := strings.TrimSpace(filter.KeyID); keyID != "" {
+		args = append(args, keyID)
+		where = append(where, fmt.Sprintf("api_key_id = $%d", len(args)))
+	}
+	args = append(args, limit)
+	query := fmt.Sprintf(`select id, public_path, file_path, original_name, size_bytes, mime_type, sha256, coalesce(api_key_id, ''), api_key_name, created_at
+		from images where %s order by created_at desc limit $%d`, strings.Join(where, " and "), len(args))
+	rows, err := s.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ImageRecord
+	for rows.Next() {
+		var item ImageRecord
+		if err := rows.Scan(&item.ID, &item.PublicPath, &item.FilePath, &item.OriginalName, &item.SizeBytes, &item.MimeType, &item.SHA256, &item.APIKeyID, &item.APIKeyName, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		item.URL = s.cfg.PublicBaseURL + item.PublicPath
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *Server) deleteImageByID(ctx context.Context, id string) error {
+	var path string
+	var size int64
+	err := s.db.QueryRow(ctx, `select file_path, size_bytes from images where id = $1 and deleted_at is null`, id).Scan(&path, &size)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	_, err = s.markDeleted(ctx, id, size)
+	return err
 }
 
 type CleanupResult struct {
@@ -675,7 +958,7 @@ func (s *Server) markDeleted(ctx context.Context, id string, size int64) (bool, 
 	return true, tx.Commit(ctx)
 }
 
-func (s *Server) checkUploadAuth(r *http.Request) (string, bool) {
+func (s *Server) checkUploadAuth(r *http.Request) (UploadPrincipal, bool) {
 	key := strings.TrimSpace(r.Header.Get("X-API-Key"))
 	if key == "" {
 		auth := r.Header.Get("Authorization")
@@ -683,8 +966,112 @@ func (s *Server) checkUploadAuth(r *http.Request) (string, bool) {
 			key = strings.TrimSpace(auth[7:])
 		}
 	}
-	name, ok := s.cfg.UploadKeys[key]
-	return name, ok
+	if key == "" {
+		return UploadPrincipal{}, false
+	}
+	hash := hashAPIKey(key)
+	var principal UploadPrincipal
+	var enabled bool
+	err := s.db.QueryRow(r.Context(), `select id, name, enabled from api_keys where key_hash = $1`, hash).Scan(&principal.ID, &principal.Name, &enabled)
+	if err == nil {
+		if enabled {
+			return principal, true
+		}
+		return UploadPrincipal{}, false
+	}
+	return UploadPrincipal{}, false
+}
+
+func (s *Server) seedEnvAPIKeys(ctx context.Context) error {
+	for key, name := range s.cfg.UploadKeys {
+		if key == "" {
+			continue
+		}
+		id := "key_" + randomHex(8)
+		_, err := s.db.Exec(ctx, `insert into api_keys (id, name, key_hash, prefix, enabled)
+			values ($1, $2, $3, $4, true) on conflict (key_hash) do nothing`, id, name, hashAPIKey(key), keyPrefix(key))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) writeUploadLog(ctx context.Context, item UploadLog) error {
+	_, err := s.db.Exec(ctx, `insert into upload_logs
+		(image_id, api_key_id, api_key_name, original_name, size_bytes, mime_type, ip, user_agent, status, message)
+		values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		emptyToNil(item.ImageID), emptyToNil(item.APIKeyID), item.APIKeyName, item.OriginalName, item.SizeBytes, item.MimeType, item.IP, item.UserAgent, item.Status, item.Message)
+	return err
+}
+
+func (s *Server) listAPIKeys(ctx context.Context) ([]APIKey, error) {
+	rows, err := s.db.Query(ctx, `select id, name, key_hash, prefix, enabled, created_at, coalesce(last_used_at, '0001-01-01 00:00:00+00'::timestamptz) from api_keys order by created_at desc`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []APIKey
+	for rows.Next() {
+		var item APIKey
+		if err := rows.Scan(&item.ID, &item.Name, &item.KeyHash, &item.Prefix, &item.Enabled, &item.CreatedAt, &item.LastUsedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *Server) listUploadLogs(ctx context.Context, limit int) ([]UploadLog, error) {
+	rows, err := s.db.Query(ctx, `select id, coalesce(image_id, ''), coalesce(api_key_id, ''), api_key_name, original_name, size_bytes, mime_type, ip, user_agent, status, message, created_at
+		from upload_logs order by created_at desc limit $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []UploadLog
+	for rows.Next() {
+		var item UploadLog
+		if err := rows.Scan(&item.ID, &item.ImageID, &item.APIKeyID, &item.APIKeyName, &item.OriginalName, &item.SizeBytes, &item.MimeType, &item.IP, &item.UserAgent, &item.Status, &item.Message, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func hashAPIKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(sum[:])
+}
+
+func keyPrefix(key string) string {
+	if len(key) <= 10 {
+		return key
+	}
+	return key[:6] + "..." + key[len(key)-4:]
+}
+
+func emptyToNil(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
+}
+
+func clientIP(r *http.Request) string {
+	for _, header := range []string{"X-Forwarded-For", "X-Real-IP"} {
+		value := strings.TrimSpace(r.Header.Get(header))
+		if value == "" {
+			continue
+		}
+		return strings.TrimSpace(strings.Split(value, ",")[0])
+	}
+	host := r.RemoteAddr
+	if index := strings.LastIndex(host, ":"); index > -1 {
+		return host[:index]
+	}
+	return host
 }
 
 func (s *Server) withCORS(next http.HandlerFunc) http.HandlerFunc {
@@ -777,6 +1164,22 @@ func render(w http.ResponseWriter, raw string, data any) {
 	}
 }
 
+func renderAdmin(w http.ResponseWriter, page string, data map[string]any) {
+	if data == nil {
+		data = map[string]any{}
+	}
+	data["Page"] = page
+	tpl := template.Must(template.New("admin").Funcs(template.FuncMap{
+		"bytes": formatBytes,
+		"date":  formatTime,
+		"short": shortText,
+	}).Parse(adminTemplateV2))
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := tpl.Execute(w, data); err != nil {
+		log.Printf("render admin page: %v", err)
+	}
+}
+
 func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -862,6 +1265,32 @@ func formatBytes(bytes int64) string {
 	return fmt.Sprintf("%.2f %s", value, units[unit])
 }
 
+func formatTime(value any) string {
+	switch typed := value.(type) {
+	case time.Time:
+		if typed.IsZero() {
+			return "-"
+		}
+		return typed.Local().Format("2006-01-02 15:04:05")
+	case *time.Time:
+		if typed == nil || typed.IsZero() {
+			return "-"
+		}
+		return typed.Local().Format("2006-01-02 15:04:05")
+	default:
+		return "-"
+	}
+}
+
+func shortText(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if max <= 0 || len([]rune(value)) <= max {
+		return value
+	}
+	runes := []rune(value)
+	return string(runes[:max]) + "..."
+}
+
 const loginTemplate = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -886,6 +1315,217 @@ button{width:100%;border:0;border-radius:6px;background:#1769e0;color:#fff;paddi
 <label>密码</label><input type="password" name="password" autocomplete="current-password" required>
 <button type="submit">登录</button>
 </form>
+</body>
+</html>`
+
+const loginTemplateV2 = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>图床后台登录</title>
+<style>
+body{margin:0;font-family:Inter,Arial,"Microsoft YaHei",sans-serif;background:#f5f7fb;color:#172033;display:grid;place-items:center;min-height:100vh}
+.box{width:min(360px,calc(100vw - 32px));background:#fff;border:1px solid #dce3ee;border-radius:8px;padding:24px;box-shadow:0 18px 50px #20305018}
+h1{font-size:22px;margin:0 0 18px}
+label{display:block;font-size:13px;color:#536175;margin:14px 0 6px}
+input{width:100%;box-sizing:border-box;border:1px solid #cfd8e5;border-radius:6px;padding:10px 12px;font-size:14px}
+button{width:100%;border:0;border-radius:6px;background:#1769e0;color:#fff;padding:11px 12px;margin-top:18px;font-weight:700;cursor:pointer}
+.err{background:#fff1f0;border:1px solid #ffccc7;color:#a8071a;border-radius:6px;padding:8px 10px;font-size:13px;margin-bottom:12px}
+</style>
+</head>
+<body>
+<form class="box" method="post" action="/admin/login">
+<h1>图床后台</h1>
+{{if .Error}}<div class="err">{{.Error}}</div>{{end}}
+<label>用户名</label><input name="username" autocomplete="username" required>
+<label>密码</label><input type="password" name="password" autocomplete="current-password" required>
+<button type="submit">登录</button>
+</form>
+</body>
+</html>`
+
+const adminTemplateV2 = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>图床后台</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:Inter,Arial,"Microsoft YaHei",sans-serif;background:#f4f7fb;color:#172033}
+.layout{display:flex;min-height:100vh}
+.side{width:228px;background:#111827;color:#d9e2f2;padding:18px 14px;position:sticky;top:0;height:100vh}
+.brand{font-weight:800;font-size:18px;color:#fff;margin:4px 8px 20px}
+.nav a{display:block;color:#d9e2f2;text-decoration:none;padding:10px 12px;border-radius:6px;margin:4px 0;font-size:14px}
+.nav a.active,.nav a:hover{background:#1f6feb;color:#fff}
+.main{flex:1;min-width:0}
+.top{height:56px;background:#fff;border-bottom:1px solid #dce3ee;display:flex;align-items:center;justify-content:space-between;padding:0 24px}
+.top h1{font-size:18px;margin:0}
+.content{padding:22px;max-width:1280px}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+.card{background:#fff;border:1px solid #dce3ee;border-radius:8px;padding:16px;margin-bottom:16px}
+.k{font-size:12px;color:#65758b}.v{font-size:24px;font-weight:800;margin-top:8px}
+h2{font-size:16px;margin:0 0 14px}
+form.inline{display:inline}
+button,.btn{border:0;border-radius:6px;background:#1769e0;color:#fff;padding:8px 12px;font-weight:700;cursor:pointer;text-decoration:none;display:inline-block}
+button.secondary,.btn.secondary{background:#eef3fb;color:#1f2a44}
+button.danger{background:#d93025}
+input,select{border:1px solid #cfd8e5;border-radius:6px;padding:8px 10px;font-size:14px;width:100%}
+label{display:block;font-size:12px;color:#536175;margin:8px 0 5px}
+.row{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;align-items:end}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:10px;border-bottom:1px solid #e7edf5;text-align:left;vertical-align:middle}
+th{color:#536175;font-weight:700;background:#fafcff}
+a{color:#1769e0;text-decoration:none}
+.thumb{width:52px;height:52px;object-fit:cover;border-radius:6px;background:#eef3fb}
+code,pre{background:#eef3fb;border-radius:6px}
+code{padding:2px 5px}
+pre{padding:14px;overflow:auto;line-height:1.6}
+.alert{background:#e8f7ee;border:1px solid #b7ebc6;color:#135c2c;padding:12px;border-radius:8px;margin-bottom:16px}
+.muted{color:#65758b}
+.tag{display:inline-block;padding:2px 7px;border-radius:999px;background:#eef3fb;color:#1f2a44}
+.tag.ok{background:#e8f7ee;color:#137333}.tag.bad{background:#fff1f0;color:#a8071a}
+@media(max-width:900px){.layout{display:block}.side{position:relative;width:auto;height:auto}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.row{grid-template-columns:1fr 1fr}.content{padding:14px}}
+</style>
+</head>
+<body>
+<div class="layout">
+<aside class="side">
+<div class="brand">AI 图床</div>
+<nav class="nav">
+<a class="{{if eq .Page "overview"}}active{{end}}" href="/admin">概览</a>
+<a class="{{if eq .Page "images"}}active{{end}}" href="/admin/images">图片管理</a>
+<a class="{{if eq .Page "api_keys"}}active{{end}}" href="/admin/api-keys">API 密钥</a>
+<a class="{{if eq .Page "logs"}}active{{end}}" href="/admin/logs">上传日志</a>
+<a class="{{if eq .Page "docs"}}active{{end}}" href="/admin/docs">接入文档</a>
+<a class="{{if eq .Page "settings"}}active{{end}}" href="/admin/settings">系统设置</a>
+</nav>
+</aside>
+<main class="main">
+<header class="top">
+<h1>{{if eq .Page "overview"}}概览{{else if eq .Page "images"}}图片管理{{else if eq .Page "api_keys"}}API 密钥{{else if eq .Page "logs"}}上传日志{{else if eq .Page "docs"}}接入文档{{else}}系统设置{{end}}</h1>
+<form class="inline" method="post" action="/admin/logout"><button class="secondary">退出登录</button></form>
+</header>
+<section class="content">
+
+{{if eq .Page "overview"}}
+<section class="grid">
+<div class="card"><div class="k">当前图片数</div><div class="v">{{.Stats.ImageCount}}</div></div>
+<div class="card"><div class="k">已用容量</div><div class="v">{{.TotalHuman}}</div></div>
+<div class="card"><div class="k">API 密钥数</div><div class="v">{{.APIKeyCount}}</div></div>
+<div class="card"><div class="k">单图上传上限</div><div class="v">{{.MaxUpload}}</div></div>
+</section>
+<section class="card">
+<h2>最近上传图片</h2>
+<table><thead><tr><th>预览</th><th>地址</th><th>大小</th><th>密钥</th><th>上传时间</th></tr></thead><tbody>
+{{range .Recent}}<tr><td><a href="{{.URL}}" target="_blank"><img class="thumb" src="{{.PublicPath}}" alt=""></a></td><td><a href="{{.URL}}" target="_blank">{{.PublicPath}}</a></td><td>{{bytes .SizeBytes}}</td><td>{{.APIKeyName}}</td><td>{{date .CreatedAt}}</td></tr>{{else}}<tr><td colspan="5">还没有上传图片。</td></tr>{{end}}
+</tbody></table>
+</section>
+<section class="card">
+<h2>最近上传日志</h2>
+<table><thead><tr><th>状态</th><th>文件</th><th>大小</th><th>密钥</th><th>时间</th></tr></thead><tbody>
+{{range .Logs}}<tr><td>{{if eq .Status "success"}}<span class="tag ok">成功</span>{{else}}<span class="tag bad">失败</span>{{end}}</td><td>{{.OriginalName}}</td><td>{{bytes .SizeBytes}}</td><td>{{.APIKeyName}}</td><td>{{date .CreatedAt}}</td></tr>{{else}}<tr><td colspan="5">暂无日志。</td></tr>{{end}}
+</tbody></table>
+</section>
+{{end}}
+
+{{if eq .Page "images"}}
+<section class="card">
+<h2>搜索筛选</h2>
+<form method="get" action="/admin/images" class="row">
+<div><label>关键词</label><input name="q" value="{{.Filter.Query}}" placeholder="文件名、ID、SHA256"></div>
+<div><label>开始日期</label><input type="date" name="from" value="{{.Filter.From}}"></div>
+<div><label>结束日期</label><input type="date" name="to" value="{{.Filter.To}}"></div>
+<div><label>API 密钥</label><select name="key_id"><option value="">全部</option>{{range .Keys}}<option value="{{.ID}}" {{if eq $.Filter.KeyID .ID}}selected{{end}}>{{.Name}}（{{.Prefix}}）</option>{{end}}</select></div>
+<div><button type="submit">查询</button></div>
+</form>
+</section>
+<section class="card">
+<h2>图片列表</h2>
+<table><thead><tr><th>预览</th><th>文件</th><th>大小</th><th>类型</th><th>密钥</th><th>上传时间</th><th>操作</th></tr></thead><tbody>
+{{range .Images}}<tr>
+<td><a href="{{.URL}}" target="_blank"><img class="thumb" src="{{.PublicPath}}" alt=""></a></td>
+<td><a href="{{.URL}}" target="_blank">{{.OriginalName}}</a><br><span class="muted">{{.PublicPath}}</span></td>
+<td>{{bytes .SizeBytes}}</td><td>{{.MimeType}}</td><td>{{.APIKeyName}}</td><td>{{date .CreatedAt}}</td>
+<td><form method="post" action="/admin/images/delete" onsubmit="return confirm('确定删除这张图片吗？')"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">删除</button></form></td>
+</tr>{{else}}<tr><td colspan="7">没有找到图片。</td></tr>{{end}}
+</tbody></table>
+</section>
+{{end}}
+
+{{if eq .Page "api_keys"}}
+{{if .CreatedKey}}<div class="alert"><strong>新密钥已生成，只显示这一次：</strong><br><code>{{.CreatedKey}}</code></div>{{end}}
+<section class="card">
+<h2>生成 API 密钥</h2>
+<form method="post" action="/admin/api-keys" class="row">
+<div style="grid-column:span 4"><label>密钥名称</label><input name="name" placeholder="例如：画布上传、测试环境"></div>
+<div><button type="submit">生成密钥</button></div>
+</form>
+</section>
+<section class="card">
+<h2>密钥列表</h2>
+<table><thead><tr><th>名称</th><th>前缀</th><th>状态</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead><tbody>
+{{range .Keys}}<tr>
+<td>{{.Name}}</td><td><code>{{.Prefix}}</code></td><td>{{if .Enabled}}<span class="tag ok">启用</span>{{else}}<span class="tag bad">停用</span>{{end}}</td><td>{{date .CreatedAt}}</td><td>{{date .LastUsedAt}}</td>
+<td><form class="inline" method="post" action="/admin/api-keys/toggle"><input type="hidden" name="id" value="{{.ID}}"><button class="secondary" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form> <form class="inline" method="post" action="/admin/api-keys/delete" onsubmit="return confirm('确定删除这个密钥吗？')"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">删除</button></form></td>
+</tr>{{else}}<tr><td colspan="6">还没有密钥。</td></tr>{{end}}
+</tbody></table>
+</section>
+{{end}}
+
+{{if eq .Page "logs"}}
+<section class="card">
+<h2>上传日志</h2>
+<table><thead><tr><th>状态</th><th>文件</th><th>大小</th><th>类型</th><th>密钥</th><th>IP</th><th>信息</th><th>时间</th></tr></thead><tbody>
+{{range .Logs}}<tr><td>{{if eq .Status "success"}}<span class="tag ok">成功</span>{{else}}<span class="tag bad">失败</span>{{end}}</td><td>{{.OriginalName}}</td><td>{{bytes .SizeBytes}}</td><td>{{.MimeType}}</td><td>{{.APIKeyName}}</td><td>{{.IP}}</td><td title="{{.Message}}">{{short .Message 42}}</td><td>{{date .CreatedAt}}</td></tr>{{else}}<tr><td colspan="8">暂无日志。</td></tr>{{end}}
+</tbody></table>
+</section>
+{{end}}
+
+{{if eq .Page "docs"}}
+<section class="card">
+<h2>上传接口</h2>
+<p>接口地址：<code>{{.PublicBaseURL}}/api/upload</code></p>
+<p>请求方式：<code>POST multipart/form-data</code>，文件字段名使用 <code>file</code> 或 <code>image</code>。</p>
+<p>鉴权方式：请求头 <code>Authorization: Bearer 你的_API_KEY</code>，也支持 <code>X-API-Key: 你的_API_KEY</code>。</p>
+<pre>curl -X POST {{.PublicBaseURL}}/api/upload \
+  -H "Authorization: Bearer 你的_API_KEY" \
+  -F "file=@./test.png"</pre>
+<p>成功返回：</p>
+<pre>{
+  "code": 0,
+  "data": {
+    "url": "{{.PublicBaseURL}}/i/2026/07/05/example.png",
+    "publicPath": "/i/2026/07/05/example.png",
+    "sizeBytes": 12345,
+    "mimeType": "image/png"
+  },
+  "msg": "ok"
+}</pre>
+<p class="muted">给 AI 使用时，直接取返回里的 <code>data.url</code> 作为参考图地址。</p>
+</section>
+{{end}}
+
+{{if eq .Page "settings"}}
+<section class="card">
+<h2>清理设置</h2>
+<form method="post" action="/admin/settings" class="row">
+<div><label>保留天数</label><input type="number" min="1" name="retention_days" value="{{.Settings.RetentionDays}}"></div>
+<div><label>容量上限 GB</label><input type="number" min="1" name="capacity_gb" value="{{.Settings.CapacityGB}}"></div>
+<div><label>超限后清理 GB</label><input type="number" min="1" name="trim_gb" value="{{.Settings.TrimGB}}"></div>
+<div><label>清理间隔分钟</label><input type="number" min="1" name="cleanup_interval_minutes" value="{{.Settings.CleanupIntervalMinutes}}"></div>
+<div><label>每批清理数量</label><input type="number" min="100" name="cleanup_batch_size" value="{{.Settings.CleanupBatchSize}}"></div>
+<div><button type="submit">保存设置</button></div>
+</form>
+<form method="post" action="/admin/cleanup" style="margin-top:12px"><button class="secondary" type="submit">立即执行清理</button></form>
+<p class="muted">当前公网地址前缀：<code>{{.PublicBaseURL}}</code>。清理次数：{{.CleanupRuns}}，清理错误：{{.CleanupErrors}}。</p>
+</section>
+{{end}}
+
+</section>
+</main>
+</div>
 </body>
 </html>`
 

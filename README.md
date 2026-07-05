@@ -16,7 +16,9 @@ It is designed for this flow:
 - Streaming upload, no base64 payloads.
 - Local disk storage with date-based paths.
 - PostgreSQL metadata and fast aggregate stats.
-- Admin page with image count, used storage, recent images and cleanup settings.
+- Admin pages with overview, image search, single image deletion, API key
+  management, upload logs, integration docs and cleanup settings.
+- Database-backed upload API keys. New keys can be generated from the admin UI.
 - Default cleanup: delete images older than 7 days.
 - Default capacity policy: 100 GB cap, trim to 70 GB after overflow.
 - Simple CORS support for browser uploads from your canvas domain.
