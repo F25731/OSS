@@ -389,11 +389,11 @@ func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
-		render(w, loginTemplate, map[string]any{"Error": "Invalid form"})
+		render(w, loginTemplate, map[string]any{"Error": "表单无效"})
 		return
 	}
 	if r.FormValue("username") != s.cfg.AdminUser || r.FormValue("password") != s.cfg.AdminPassword {
-		render(w, loginTemplate, map[string]any{"Error": "Invalid username or password"})
+		render(w, loginTemplate, map[string]any{"Error": "用户名或密码错误"})
 		return
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -863,11 +863,11 @@ func formatBytes(bytes int64) string {
 }
 
 const loginTemplate = `<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Image Bed Login</title>
+<title>图床后台登录</title>
 <style>
 body{margin:0;font-family:Inter,Arial,sans-serif;background:#f5f7fb;color:#172033;display:grid;place-items:center;min-height:100vh}
 .box{width:min(360px,calc(100vw - 32px));background:#fff;border:1px solid #dce3ee;border-radius:8px;padding:24px;box-shadow:0 18px 50px #20305018}
@@ -880,21 +880,21 @@ button{width:100%;border:0;border-radius:6px;background:#1769e0;color:#fff;paddi
 </head>
 <body>
 <form class="box" method="post" action="/admin/login">
-<h1>Image Bed Admin</h1>
+<h1>图床后台</h1>
 {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
-<label>Username</label><input name="username" autocomplete="username" required>
-<label>Password</label><input type="password" name="password" autocomplete="current-password" required>
-<button type="submit">Login</button>
+<label>用户名</label><input name="username" autocomplete="username" required>
+<label>密码</label><input type="password" name="password" autocomplete="current-password" required>
+<button type="submit">登录</button>
 </form>
 </body>
 </html>`
 
 const adminTemplate = `<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Image Bed Admin</title>
+<title>图床后台</title>
 <style>
 body{margin:0;font-family:Inter,Arial,sans-serif;background:#f5f7fb;color:#172033}
 header{height:56px;background:#111827;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 24px}
@@ -920,35 +920,35 @@ code{background:#eef3fb;padding:2px 5px;border-radius:4px}
 </head>
 <body>
 <header>
-<strong>AI Image Bed</strong>
-<form class="inline" method="post" action="/admin/logout"><button class="secondary">Logout</button></form>
+<strong>AI 图床</strong>
+<form class="inline" method="post" action="/admin/logout"><button class="secondary">退出登录</button></form>
 </header>
 <main>
 <section class="grid">
-<div class="card"><div class="k">Active images</div><div class="v">{{.Stats.ImageCount}}</div></div>
-<div class="card"><div class="k">Storage used</div><div class="v">{{.TotalHuman}}</div></div>
-<div class="card"><div class="k">Capacity</div><div class="v">{{.CapacityHuman}}</div></div>
-<div class="card"><div class="k">Max upload</div><div class="v">{{.MaxUpload}}</div></div>
+<div class="card"><div class="k">当前图片数</div><div class="v">{{.Stats.ImageCount}}</div></div>
+<div class="card"><div class="k">已用容量</div><div class="v">{{.TotalHuman}}</div></div>
+<div class="card"><div class="k">容量上限</div><div class="v">{{.CapacityHuman}}</div></div>
+<div class="card"><div class="k">单图上传上限</div><div class="v">{{.MaxUpload}}</div></div>
 </section>
 
 <section class="card" style="margin-top:16px">
-<h2>Cleanup Settings</h2>
+<h2>清理设置</h2>
 <form method="post" action="/admin/settings" class="settings">
-<div><label>Retention days</label><input type="number" min="1" name="retention_days" value="{{.Settings.RetentionDays}}"></div>
-<div><label>Capacity GB</label><input type="number" min="1" name="capacity_gb" value="{{.Settings.CapacityGB}}"></div>
-<div><label>Trim GB after overflow</label><input type="number" min="1" name="trim_gb" value="{{.Settings.TrimGB}}"></div>
-<div><label>Cleanup interval minutes</label><input type="number" min="1" name="cleanup_interval_minutes" value="{{.Settings.CleanupIntervalMinutes}}"></div>
-<div><label>Batch size</label><input type="number" min="100" name="cleanup_batch_size" value="{{.Settings.CleanupBatchSize}}"></div>
-<div><button type="submit">Save Settings</button></div>
+<div><label>保留天数</label><input type="number" min="1" name="retention_days" value="{{.Settings.RetentionDays}}"></div>
+<div><label>容量上限 GB</label><input type="number" min="1" name="capacity_gb" value="{{.Settings.CapacityGB}}"></div>
+<div><label>超限后清理 GB</label><input type="number" min="1" name="trim_gb" value="{{.Settings.TrimGB}}"></div>
+<div><label>清理间隔分钟</label><input type="number" min="1" name="cleanup_interval_minutes" value="{{.Settings.CleanupIntervalMinutes}}"></div>
+<div><label>每批清理数量</label><input type="number" min="100" name="cleanup_batch_size" value="{{.Settings.CleanupBatchSize}}"></div>
+<div><button type="submit">保存设置</button></div>
 </form>
-<form method="post" action="/admin/cleanup" style="margin-top:12px"><button class="secondary" type="submit">Run Cleanup Now</button></form>
-<p class="k">Cleanup runs: {{.CleanupRuns}}, errors: {{.CleanupErrors}}. Public base URL: <code>{{.PublicBaseURL}}</code></p>
+<form method="post" action="/admin/cleanup" style="margin-top:12px"><button class="secondary" type="submit">立即执行清理</button></form>
+<p class="k">清理次数：{{.CleanupRuns}}，清理错误：{{.CleanupErrors}}。公网地址前缀：<code>{{.PublicBaseURL}}</code></p>
 </section>
 
 <section class="card" style="margin-top:16px">
-<h2>Recent Images</h2>
+<h2>最近上传</h2>
 <table>
-<thead><tr><th>Preview</th><th>URL</th><th>Size</th><th>MIME</th><th>API key</th><th>Created</th></tr></thead>
+<thead><tr><th>预览</th><th>地址</th><th>大小</th><th>类型</th><th>接口密钥</th><th>上传时间</th></tr></thead>
 <tbody>
 {{range .Recent}}
 <tr>
@@ -959,7 +959,7 @@ code{background:#eef3fb;padding:2px 5px;border-radius:4px}
 <td>{{.APIKeyName}}</td>
 <td>{{.CreatedAt.Format "2006-01-02 15:04:05"}}</td>
 </tr>
-{{else}}<tr><td colspan="6">No images yet.</td></tr>{{end}}
+{{else}}<tr><td colspan="6">还没有上传图片。</td></tr>{{end}}
 </tbody>
 </table>
 </section>
