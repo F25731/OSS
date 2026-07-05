@@ -33,7 +33,7 @@ docker compose up -d --build
 Open:
 
 ```text
-http://localhost:8080/admin
+http://localhost:8080/fyanxv
 ```
 
 Upload:
@@ -52,7 +52,7 @@ Response:
   "data": {
     "id": "...",
     "publicPath": "/i/2026/07/05/....png",
-    "url": "https://img.example.com/i/2026/07/05/....png",
+    "url": "https://tc.zmoapi.cn/i/2026/07/05/....png",
     "sizeBytes": 12345
   },
   "msg": "ok"
@@ -69,8 +69,8 @@ Response:
 | `STORAGE_DIR` | `./data/images` | Image files are stored here. |
 | `PUBLIC_BASE_URL` | `http://localhost:8080` | Prefix used for returned image URLs. |
 | `MAX_UPLOAD_MB` | `50` | Single image upload limit. |
-| `ADMIN_USER` | `admin` | Admin login username. |
-| `ADMIN_PASSWORD` | `admin123` | Change in production. |
+| `ADMIN_USER` | `Fyanxv` | Admin login username. |
+| `ADMIN_PASSWORD` | `Fyb2530+` | Change in production. |
 | `SESSION_SECRET` | random per boot | Set a stable random string in production. |
 | `UPLOAD_API_KEYS` | `dev-key` | Format: `key:name,key2:name2`. |
 | `CORS_ALLOW_ORIGINS` | empty | Comma-separated origins, or `*`. |

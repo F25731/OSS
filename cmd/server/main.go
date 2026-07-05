@@ -109,6 +109,8 @@ type Settings struct {
 	TrimGB                 int
 	CleanupIntervalMinutes int
 	CleanupBatchSize       int
+	LogRetentionDays       int
+	DeletedRecordRetentionDays int
 }
 
 type JSONResponse struct {
@@ -143,9 +145,6 @@ func main() {
 	go srv.cleanupLoop()
 
 	log.Printf("image bed listening on %s, storage=%s", cfg.ListenAddr, cfg.StorageDir)
-	if cfg.AdminPassword == "admin123" {
-		log.Printf("WARNING: ADMIN_PASSWORD is using the default value")
-	}
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           srv.routes(),
@@ -169,8 +168,8 @@ func loadConfig() Config {
 		StorageDir:       filepath.Clean(env("STORAGE_DIR", "./data/images")),
 		PublicBaseURL:    strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
 		MaxUploadBytes:   int64(maxMB) * 1024 * 1024,
-		AdminUser:        env("ADMIN_USER", "admin"),
-		AdminPassword:    env("ADMIN_PASSWORD", "admin123"),
+		AdminUser:        env("ADMIN_USER", "Fyanxv"),
+		AdminPassword:    env("ADMIN_PASSWORD", "Fyb2530+"),
 		SessionSecret:    env("SESSION_SECRET", randomHex(32)),
 		UploadKeys:       parseUploadKeys(env("UPLOAD_API_KEYS", "dev-key")),
 		CORSAllowOrigins: splitCSV(env("CORS_ALLOW_ORIGINS", "")),
@@ -183,21 +182,21 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/upload", s.withCORS(s.handleUpload))
 	mux.HandleFunc("OPTIONS /api/upload", s.withCORS(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	mux.HandleFunc("GET /api/status", s.requireAdmin(s.handleAPIStatus))
-	mux.HandleFunc("GET /admin/login", s.handleLoginPage)
-	mux.HandleFunc("POST /admin/login", s.handleLogin)
-	mux.HandleFunc("POST /admin/logout", s.requireAdmin(s.handleLogout))
-	mux.HandleFunc("GET /admin", s.requireAdmin(s.handleAdmin))
-	mux.HandleFunc("GET /admin/images", s.requireAdmin(s.handleImages))
-	mux.HandleFunc("POST /admin/images/delete", s.requireAdmin(s.handleImageDelete))
-	mux.HandleFunc("GET /admin/api-keys", s.requireAdmin(s.handleAPIKeys))
-	mux.HandleFunc("POST /admin/api-keys", s.requireAdmin(s.handleAPIKeyCreate))
-	mux.HandleFunc("POST /admin/api-keys/toggle", s.requireAdmin(s.handleAPIKeyToggle))
-	mux.HandleFunc("POST /admin/api-keys/delete", s.requireAdmin(s.handleAPIKeyDelete))
-	mux.HandleFunc("GET /admin/logs", s.requireAdmin(s.handleLogs))
-	mux.HandleFunc("GET /admin/docs", s.requireAdmin(s.handleDocs))
-	mux.HandleFunc("GET /admin/settings", s.requireAdmin(s.handleSettings))
-	mux.HandleFunc("POST /admin/settings", s.requireAdmin(s.handleSettingsUpdate))
-	mux.HandleFunc("POST /admin/cleanup", s.requireAdmin(s.handleCleanupNow))
+	mux.HandleFunc("GET /fyanxv/login", s.handleLoginPage)
+	mux.HandleFunc("POST /fyanxv/login", s.handleLogin)
+	mux.HandleFunc("POST /fyanxv/logout", s.requireAdmin(s.handleLogout))
+	mux.HandleFunc("GET /fyanxv", s.requireAdmin(s.handleAdmin))
+	mux.HandleFunc("GET /fyanxv/images", s.requireAdmin(s.handleImages))
+	mux.HandleFunc("POST /fyanxv/images/delete", s.requireAdmin(s.handleImageDelete))
+	mux.HandleFunc("GET /fyanxv/api-keys", s.requireAdmin(s.handleAPIKeys))
+	mux.HandleFunc("POST /fyanxv/api-keys", s.requireAdmin(s.handleAPIKeyCreate))
+	mux.HandleFunc("POST /fyanxv/api-keys/toggle", s.requireAdmin(s.handleAPIKeyToggle))
+	mux.HandleFunc("POST /fyanxv/api-keys/delete", s.requireAdmin(s.handleAPIKeyDelete))
+	mux.HandleFunc("GET /fyanxv/logs", s.requireAdmin(s.handleLogs))
+	mux.HandleFunc("GET /fyanxv/docs", s.requireAdmin(s.handleDocs))
+	mux.HandleFunc("GET /fyanxv/settings", s.requireAdmin(s.handleSettings))
+	mux.HandleFunc("POST /fyanxv/settings", s.requireAdmin(s.handleSettingsUpdate))
+	mux.HandleFunc("POST /fyanxv/cleanup", s.requireAdmin(s.handleCleanupNow))
 	mux.Handle("/i/", http.StripPrefix("/i/", http.FileServer(http.Dir(s.cfg.StorageDir))))
 	return logRequests(mux)
 }
@@ -270,6 +269,8 @@ func (s *Server) migrate(ctx context.Context) error {
 		"trim_gb":                  "30",
 		"cleanup_interval_minutes": "10",
 		"cleanup_batch_size":       "1000",
+		"log_retention_days":       "30",
+		"deleted_record_retention_days": "7",
 	}
 	for key, value := range defaults {
 		if _, err := s.db.Exec(ctx, `insert into settings (key, value) values ($1, $2) on conflict (key) do nothing`, key, value); err != nil {
@@ -469,7 +470,7 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 	if s.validSession(r) {
-		http.Redirect(w, r, "/admin", http.StatusFound)
+		http.Redirect(w, r, "/fyanxv", http.StatusFound)
 		return
 	}
 	render(w, loginTemplateV2, map[string]any{"Error": ""})
@@ -491,12 +492,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	})
-	http.Redirect(w, r, "/admin", http.StatusFound)
+	http.Redirect(w, r, "/fyanxv", http.StatusFound)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{Name: "image_bed_session", Value: "", Path: "/", MaxAge: -1})
-	http.Redirect(w, r, "/admin/login", http.StatusFound)
+	http.Redirect(w, r, "/fyanxv/login", http.StatusFound)
 }
 
 func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
@@ -568,7 +569,7 @@ func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/admin/images", http.StatusFound)
+	http.Redirect(w, r, "/fyanxv/images", http.StatusFound)
 }
 
 func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request) {
@@ -599,7 +600,7 @@ func (s *Server) handleAPIKeyCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/admin/api-keys?created_key="+raw, http.StatusFound)
+	http.Redirect(w, r, "/fyanxv/api-keys?created_key="+raw, http.StatusFound)
 }
 
 func (s *Server) handleAPIKeyToggle(w http.ResponseWriter, r *http.Request) {
@@ -613,7 +614,7 @@ func (s *Server) handleAPIKeyToggle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/admin/api-keys", http.StatusFound)
+	http.Redirect(w, r, "/fyanxv/api-keys", http.StatusFound)
 }
 
 func (s *Server) handleAPIKeyDelete(w http.ResponseWriter, r *http.Request) {
@@ -627,7 +628,7 @@ func (s *Server) handleAPIKeyDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/admin/api-keys", http.StatusFound)
+	http.Redirect(w, r, "/fyanxv/api-keys", http.StatusFound)
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
@@ -675,12 +676,14 @@ func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 		TrimGB:                 positiveFormInt(r, "trim_gb", 30),
 		CleanupIntervalMinutes: positiveFormInt(r, "cleanup_interval_minutes", 10),
 		CleanupBatchSize:       positiveFormInt(r, "cleanup_batch_size", 1000),
+		LogRetentionDays:       positiveFormInt(r, "log_retention_days", 30),
+		DeletedRecordRetentionDays: positiveFormInt(r, "deleted_record_retention_days", 7),
 	}
 	if err := s.saveSettings(r.Context(), settings); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/admin/settings", http.StatusFound)
+	http.Redirect(w, r, "/fyanxv/settings", http.StatusFound)
 }
 
 func (s *Server) handleCleanupNow(w http.ResponseWriter, r *http.Request) {
@@ -690,7 +693,7 @@ func (s *Server) handleCleanupNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("manual cleanup: deleted=%d freed=%s", result.Deleted, formatBytes(result.FreedBytes))
-	http.Redirect(w, r, "/admin/settings", http.StatusFound)
+	http.Redirect(w, r, "/fyanxv/settings", http.StatusFound)
 }
 
 func (s *Server) readStats(ctx context.Context) (Stats, error) {
@@ -719,6 +722,8 @@ func (s *Server) readSettings(ctx context.Context) (Settings, error) {
 		TrimGB:                 positiveInt(values["trim_gb"], 30),
 		CleanupIntervalMinutes: positiveInt(values["cleanup_interval_minutes"], 10),
 		CleanupBatchSize:       positiveInt(values["cleanup_batch_size"], 1000),
+		LogRetentionDays:       positiveInt(values["log_retention_days"], 30),
+		DeletedRecordRetentionDays: positiveInt(values["deleted_record_retention_days"], 7),
 	}, rows.Err()
 }
 
@@ -729,6 +734,8 @@ func (s *Server) saveSettings(ctx context.Context, settings Settings) error {
 		"trim_gb":                  settings.TrimGB,
 		"cleanup_interval_minutes": settings.CleanupIntervalMinutes,
 		"cleanup_batch_size":       settings.CleanupBatchSize,
+		"log_retention_days":       settings.LogRetentionDays,
+		"deleted_record_retention_days": settings.DeletedRecordRetentionDays,
 	}
 	for key, value := range values {
 		if _, err := s.db.Exec(ctx, `insert into settings (key, value) values ($1, $2) on conflict (key) do update set value = excluded.value`, key, strconv.Itoa(value)); err != nil {
@@ -881,8 +888,43 @@ func (s *Server) runCleanup(ctx context.Context) (CleanupResult, error) {
 		total.Deleted += result.Deleted
 		total.FreedBytes += result.FreedBytes
 	}
+	if settings.LogRetentionDays > 0 {
+		if err := s.purgeOldUploadLogs(ctx, settings); err != nil {
+			return total, err
+		}
+	}
+	if settings.DeletedRecordRetentionDays > 0 {
+		if err := s.purgeDeletedImageRecords(ctx, settings); err != nil {
+			return total, err
+		}
+	}
 	s.cleanupRuns.Add(1)
 	return total, nil
+}
+
+func (s *Server) purgeOldUploadLogs(ctx context.Context, settings Settings) error {
+	cutoff := time.Now().Add(-time.Duration(settings.LogRetentionDays) * 24 * time.Hour)
+	return s.deleteInBatches(ctx, `delete from upload_logs where id in (select id from upload_logs where created_at < $1 order by created_at asc limit $2)`, cutoff, settings.CleanupBatchSize)
+}
+
+func (s *Server) purgeDeletedImageRecords(ctx context.Context, settings Settings) error {
+	cutoff := time.Now().Add(-time.Duration(settings.DeletedRecordRetentionDays) * 24 * time.Hour)
+	return s.deleteInBatches(ctx, `delete from images where id in (select id from images where deleted_at is not null and deleted_at < $1 order by deleted_at asc limit $2)`, cutoff, settings.CleanupBatchSize)
+}
+
+func (s *Server) deleteInBatches(ctx context.Context, query string, cutoff time.Time, batchSize int) error {
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
+	for {
+		tag, err := s.db.Exec(ctx, query, cutoff, batchSize)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return nil
+		}
+	}
 }
 
 func (s *Server) deleteOldestWhere(ctx context.Context, where string, args []any, batchSize int, stopAfterBytes int64) (CleanupResult, error) {
@@ -1102,7 +1144,7 @@ func (s *Server) originAllowed(origin string) bool {
 func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.validSession(r) {
-			http.Redirect(w, r, "/admin/login", http.StatusFound)
+			http.Redirect(w, r, "/fyanxv/login", http.StatusFound)
 			return
 		}
 		next(w, r)
@@ -1296,7 +1338,7 @@ const loginTemplate = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>图床后台登录</title>
+<title>Fyanxv 登录</title>
 <style>
 body{margin:0;font-family:Inter,Arial,sans-serif;background:#f5f7fb;color:#172033;display:grid;place-items:center;min-height:100vh}
 .box{width:min(360px,calc(100vw - 32px));background:#fff;border:1px solid #dce3ee;border-radius:8px;padding:24px;box-shadow:0 18px 50px #20305018}
@@ -1308,8 +1350,8 @@ button{width:100%;border:0;border-radius:6px;background:#1769e0;color:#fff;paddi
 </style>
 </head>
 <body>
-<form class="box" method="post" action="/admin/login">
-<h1>图床后台</h1>
+<form class="box" method="post" action="/fyanxv/login">
+<h1>Fyanxv</h1>
 {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
 <label>用户名</label><input name="username" autocomplete="username" required>
 <label>密码</label><input type="password" name="password" autocomplete="current-password" required>
@@ -1323,7 +1365,7 @@ const loginTemplateV2 = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>图床后台登录</title>
+<title>Fyanxv 登录</title>
 <style>
 body{margin:0;font-family:Inter,Arial,"Microsoft YaHei",sans-serif;background:#f5f7fb;color:#172033;display:grid;place-items:center;min-height:100vh}
 .box{width:min(360px,calc(100vw - 32px));background:#fff;border:1px solid #dce3ee;border-radius:8px;padding:24px;box-shadow:0 18px 50px #20305018}
@@ -1335,8 +1377,8 @@ button{width:100%;border:0;border-radius:6px;background:#1769e0;color:#fff;paddi
 </style>
 </head>
 <body>
-<form class="box" method="post" action="/admin/login">
-<h1>图床后台</h1>
+<form class="box" method="post" action="/fyanxv/login">
+<h1>Fyanxv</h1>
 {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
 <label>用户名</label><input name="username" autocomplete="username" required>
 <label>密码</label><input type="password" name="password" autocomplete="current-password" required>
@@ -1350,13 +1392,14 @@ const adminTemplateV2 = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>图床后台</title>
+<title>Fyanxv 后台</title>
 <style>
 *{box-sizing:border-box}
 body{margin:0;font-family:Inter,Arial,"Microsoft YaHei",sans-serif;background:#f4f7fb;color:#172033}
 .layout{display:flex;min-height:100vh}
 .side{width:228px;background:#111827;color:#d9e2f2;padding:18px 14px;position:sticky;top:0;height:100vh}
-.brand{font-weight:800;font-size:18px;color:#fff;margin:4px 8px 20px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:18px;color:#fff;margin:4px 8px 20px}
+.brand img{width:28px;height:28px;display:block}
 .nav a{display:block;color:#d9e2f2;text-decoration:none;padding:10px 12px;border-radius:6px;margin:4px 0;font-size:14px}
 .nav a.active,.nav a:hover{background:#1f6feb;color:#fff}
 .main{flex:1;min-width:0}
@@ -1392,20 +1435,20 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <body>
 <div class="layout">
 <aside class="side">
-<div class="brand">AI 图床</div>
+<div class="brand"><img src="https://www.tfbkw.com/wp-content/themes/ZibTF/img/zm.svg" alt="Fyanxv"><span>Fyanxv</span></div>
 <nav class="nav">
-<a class="{{if eq .Page "overview"}}active{{end}}" href="/admin">概览</a>
-<a class="{{if eq .Page "images"}}active{{end}}" href="/admin/images">图片管理</a>
-<a class="{{if eq .Page "api_keys"}}active{{end}}" href="/admin/api-keys">API 密钥</a>
-<a class="{{if eq .Page "logs"}}active{{end}}" href="/admin/logs">上传日志</a>
-<a class="{{if eq .Page "docs"}}active{{end}}" href="/admin/docs">接入文档</a>
-<a class="{{if eq .Page "settings"}}active{{end}}" href="/admin/settings">系统设置</a>
+<a class="{{if eq .Page "overview"}}active{{end}}" href="/fyanxv">概览</a>
+<a class="{{if eq .Page "images"}}active{{end}}" href="/fyanxv/images">图片管理</a>
+<a class="{{if eq .Page "api_keys"}}active{{end}}" href="/fyanxv/api-keys">API 密钥</a>
+<a class="{{if eq .Page "logs"}}active{{end}}" href="/fyanxv/logs">上传日志</a>
+<a class="{{if eq .Page "docs"}}active{{end}}" href="/fyanxv/docs">接入文档</a>
+<a class="{{if eq .Page "settings"}}active{{end}}" href="/fyanxv/settings">系统设置</a>
 </nav>
 </aside>
 <main class="main">
 <header class="top">
 <h1>{{if eq .Page "overview"}}概览{{else if eq .Page "images"}}图片管理{{else if eq .Page "api_keys"}}API 密钥{{else if eq .Page "logs"}}上传日志{{else if eq .Page "docs"}}接入文档{{else}}系统设置{{end}}</h1>
-<form class="inline" method="post" action="/admin/logout"><button class="secondary">退出登录</button></form>
+<form class="inline" method="post" action="/fyanxv/logout"><button class="secondary">退出登录</button></form>
 </header>
 <section class="content">
 
@@ -1433,7 +1476,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 {{if eq .Page "images"}}
 <section class="card">
 <h2>搜索筛选</h2>
-<form method="get" action="/admin/images" class="row">
+<form method="get" action="/fyanxv/images" class="row">
 <div><label>关键词</label><input name="q" value="{{.Filter.Query}}" placeholder="文件名、ID、SHA256"></div>
 <div><label>开始日期</label><input type="date" name="from" value="{{.Filter.From}}"></div>
 <div><label>结束日期</label><input type="date" name="to" value="{{.Filter.To}}"></div>
@@ -1448,7 +1491,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <td><a href="{{.URL}}" target="_blank"><img class="thumb" src="{{.PublicPath}}" alt=""></a></td>
 <td><a href="{{.URL}}" target="_blank">{{.OriginalName}}</a><br><span class="muted">{{.PublicPath}}</span></td>
 <td>{{bytes .SizeBytes}}</td><td>{{.MimeType}}</td><td>{{.APIKeyName}}</td><td>{{date .CreatedAt}}</td>
-<td><form method="post" action="/admin/images/delete" onsubmit="return confirm('确定删除这张图片吗？')"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">删除</button></form></td>
+<td><form method="post" action="/fyanxv/images/delete" onsubmit="return confirm('确定删除这张图片吗？')"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">删除</button></form></td>
 </tr>{{else}}<tr><td colspan="7">没有找到图片。</td></tr>{{end}}
 </tbody></table>
 </section>
@@ -1458,7 +1501,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 {{if .CreatedKey}}<div class="alert"><strong>新密钥已生成，只显示这一次：</strong><br><code>{{.CreatedKey}}</code></div>{{end}}
 <section class="card">
 <h2>生成 API 密钥</h2>
-<form method="post" action="/admin/api-keys" class="row">
+<form method="post" action="/fyanxv/api-keys" class="row">
 <div style="grid-column:span 4"><label>密钥名称</label><input name="name" placeholder="例如：画布上传、测试环境"></div>
 <div><button type="submit">生成密钥</button></div>
 </form>
@@ -1468,7 +1511,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <table><thead><tr><th>名称</th><th>前缀</th><th>状态</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead><tbody>
 {{range .Keys}}<tr>
 <td>{{.Name}}</td><td><code>{{.Prefix}}</code></td><td>{{if .Enabled}}<span class="tag ok">启用</span>{{else}}<span class="tag bad">停用</span>{{end}}</td><td>{{date .CreatedAt}}</td><td>{{date .LastUsedAt}}</td>
-<td><form class="inline" method="post" action="/admin/api-keys/toggle"><input type="hidden" name="id" value="{{.ID}}"><button class="secondary" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form> <form class="inline" method="post" action="/admin/api-keys/delete" onsubmit="return confirm('确定删除这个密钥吗？')"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">删除</button></form></td>
+<td><form class="inline" method="post" action="/fyanxv/api-keys/toggle"><input type="hidden" name="id" value="{{.ID}}"><button class="secondary" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form> <form class="inline" method="post" action="/fyanxv/api-keys/delete" onsubmit="return confirm('确定删除这个密钥吗？')"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">删除</button></form></td>
 </tr>{{else}}<tr><td colspan="6">还没有密钥。</td></tr>{{end}}
 </tbody></table>
 </section>
@@ -1510,15 +1553,17 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 {{if eq .Page "settings"}}
 <section class="card">
 <h2>清理设置</h2>
-<form method="post" action="/admin/settings" class="row">
+<form method="post" action="/fyanxv/settings" class="row">
 <div><label>保留天数</label><input type="number" min="1" name="retention_days" value="{{.Settings.RetentionDays}}"></div>
 <div><label>容量上限 GB</label><input type="number" min="1" name="capacity_gb" value="{{.Settings.CapacityGB}}"></div>
 <div><label>超限后清理 GB</label><input type="number" min="1" name="trim_gb" value="{{.Settings.TrimGB}}"></div>
 <div><label>清理间隔分钟</label><input type="number" min="1" name="cleanup_interval_minutes" value="{{.Settings.CleanupIntervalMinutes}}"></div>
 <div><label>每批清理数量</label><input type="number" min="100" name="cleanup_batch_size" value="{{.Settings.CleanupBatchSize}}"></div>
+<div><label>日志保留天数</label><input type="number" min="1" name="log_retention_days" value="{{.Settings.LogRetentionDays}}"></div>
+<div><label>删除记录保留天数</label><input type="number" min="1" name="deleted_record_retention_days" value="{{.Settings.DeletedRecordRetentionDays}}"></div>
 <div><button type="submit">保存设置</button></div>
 </form>
-<form method="post" action="/admin/cleanup" style="margin-top:12px"><button class="secondary" type="submit">立即执行清理</button></form>
+<form method="post" action="/fyanxv/cleanup" style="margin-top:12px"><button class="secondary" type="submit">立即执行清理</button></form>
 <p class="muted">当前公网地址前缀：<code>{{.PublicBaseURL}}</code>。清理次数：{{.CleanupRuns}}，清理错误：{{.CleanupErrors}}。</p>
 </section>
 {{end}}
@@ -1534,7 +1579,7 @@ const adminTemplate = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>图床后台</title>
+<title>Fyanxv 后台</title>
 <style>
 body{margin:0;font-family:Inter,Arial,sans-serif;background:#f5f7fb;color:#172033}
 header{height:56px;background:#111827;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 24px}
@@ -1560,8 +1605,8 @@ code{background:#eef3fb;padding:2px 5px;border-radius:4px}
 </head>
 <body>
 <header>
-<strong>AI 图床</strong>
-<form class="inline" method="post" action="/admin/logout"><button class="secondary">退出登录</button></form>
+<strong>Fyanxv</strong>
+<form class="inline" method="post" action="/fyanxv/logout"><button class="secondary">退出登录</button></form>
 </header>
 <main>
 <section class="grid">
@@ -1573,7 +1618,7 @@ code{background:#eef3fb;padding:2px 5px;border-radius:4px}
 
 <section class="card" style="margin-top:16px">
 <h2>清理设置</h2>
-<form method="post" action="/admin/settings" class="settings">
+<form method="post" action="/fyanxv/settings" class="settings">
 <div><label>保留天数</label><input type="number" min="1" name="retention_days" value="{{.Settings.RetentionDays}}"></div>
 <div><label>容量上限 GB</label><input type="number" min="1" name="capacity_gb" value="{{.Settings.CapacityGB}}"></div>
 <div><label>超限后清理 GB</label><input type="number" min="1" name="trim_gb" value="{{.Settings.TrimGB}}"></div>
@@ -1581,7 +1626,7 @@ code{background:#eef3fb;padding:2px 5px;border-radius:4px}
 <div><label>每批清理数量</label><input type="number" min="100" name="cleanup_batch_size" value="{{.Settings.CleanupBatchSize}}"></div>
 <div><button type="submit">保存设置</button></div>
 </form>
-<form method="post" action="/admin/cleanup" style="margin-top:12px"><button class="secondary" type="submit">立即执行清理</button></form>
+<form method="post" action="/fyanxv/cleanup" style="margin-top:12px"><button class="secondary" type="submit">立即执行清理</button></form>
 <p class="k">清理次数：{{.CleanupRuns}}，清理错误：{{.CleanupErrors}}。公网地址前缀：<code>{{.PublicBaseURL}}</code></p>
 </section>
 
