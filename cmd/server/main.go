@@ -1493,7 +1493,6 @@ label{display:block;font-size:12px;color:#536175;margin:8px 0 5px}
 .section-head h2{margin:0}
 .pager{display:flex;align-items:center;justify-content:flex-end;gap:10px;margin-top:14px;color:#65758b;font-size:13px}
 .pager .disabled{opacity:.45;pointer-events:none}
-.content>.grid+.card+.card{display:none}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{padding:10px;border-bottom:1px solid #e7edf5;text-align:left;vertical-align:middle}
 th{color:#536175;font-weight:700;background:#fafcff}
@@ -1541,12 +1540,6 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <h2>最近上传图片</h2>
 <table><thead><tr><th>预览</th><th>地址</th><th>大小</th><th>密钥</th><th>上传时间</th></tr></thead><tbody>
 {{range .Recent}}<tr><td><a href="{{.URL}}" target="_blank"><img class="thumb" src="{{.PublicPath}}" alt=""></a></td><td><a href="{{.URL}}" target="_blank">{{.PublicPath}}</a></td><td>{{bytes .SizeBytes}}</td><td>{{.APIKeyName}}</td><td>{{date .CreatedAt}}</td></tr>{{else}}<tr><td colspan="5">还没有上传图片。</td></tr>{{end}}
-</tbody></table>
-</section>
-<section class="card">
-<h2>最近上传日志</h2>
-<table><thead><tr><th>状态</th><th>文件</th><th>大小</th><th>密钥</th><th>时间</th></tr></thead><tbody>
-{{range .Logs}}<tr><td>{{if eq .Status "success"}}<span class="tag ok">成功</span>{{else}}<span class="tag bad">失败</span>{{end}}</td><td>{{.OriginalName}}</td><td>{{bytes .SizeBytes}}</td><td>{{.APIKeyName}}</td><td>{{date .CreatedAt}}</td></tr>{{else}}<tr><td colspan="5">暂无日志。</td></tr>{{end}}
 </tbody></table>
 </section>
 {{end}}
