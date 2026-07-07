@@ -42,6 +42,8 @@ type Config struct {
 	PublicBaseURL                  string
 	MaxUploadBytes                 int64
 	MaxConcurrentUploads           int
+	MaxQueuedUploads               int
+	UploadQueueTimeout            time.Duration
 	UploadRateLimitPerKeyPerMinute int
 	UploadRateLimitPerIPPerMinute  int
 	UploadLogQueueSize             int
@@ -62,7 +64,9 @@ type Server struct {
 	statsFlushActive atomic.Bool
 	apiKeyLastUsed   sync.Map
 	uploadSlots      chan struct{}
+	uploadQueue      chan struct{}
 	activeUploads    atomic.Int64
+	queuedUploads    atomic.Int64
 	totalUploads     atomic.Int64
 	failedUploads    atomic.Int64
 	rateLimitedUploads atomic.Int64
@@ -191,12 +195,13 @@ func main() {
 	defer pool.Close()
 
 	srv := &Server{
-		cfg: cfg,
-		db: pool,
-		uploadSlots: make(chan struct{}, cfg.MaxConcurrentUploads),
-		rateWindows: map[string]rateWindow{},
+		cfg:            cfg,
+		db:             pool,
+		uploadSlots:    make(chan struct{}, cfg.MaxConcurrentUploads),
+		uploadQueue:    make(chan struct{}, cfg.MaxQueuedUploads),
+		rateWindows:    map[string]rateWindow{},
 		uploadLogQueue: make(chan UploadLog, cfg.UploadLogQueueSize),
-		loginAttempts: map[string]loginAttempt{},
+		loginAttempts:  map[string]loginAttempt{},
 	}
 	if err := srv.migrate(ctx); err != nil {
 		fatalEvent("database_migrate_failed", err, nil)
@@ -230,7 +235,9 @@ func loadConfig() Config {
 		StorageDir:       filepath.Clean(env("STORAGE_DIR", "./data/images")),
 		PublicBaseURL:    strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
 		MaxUploadBytes:   int64(maxMB) * 1024 * 1024,
-		MaxConcurrentUploads: envInt("MAX_CONCURRENT_UPLOADS", max(8, runtime.NumCPU()*4)),
+		MaxConcurrentUploads:           envInt("MAX_CONCURRENT_UPLOADS", max(8, runtime.NumCPU()*4)),
+		MaxQueuedUploads:               envIntAllowZero("MAX_QUEUED_UPLOADS", max(32, runtime.NumCPU()*8)),
+		UploadQueueTimeout:             time.Duration(envIntAllowZero("UPLOAD_QUEUE_TIMEOUT_SECONDS", 30)) * time.Second,
 		UploadRateLimitPerKeyPerMinute: envIntAllowZero("UPLOAD_RATE_LIMIT_PER_KEY_PER_MINUTE", 0),
 		UploadRateLimitPerIPPerMinute:  envIntAllowZero("UPLOAD_RATE_LIMIT_PER_IP_PER_MINUTE", 0),
 		UploadLogQueueSize:             envInt("UPLOAD_LOG_QUEUE_SIZE", 4096),
@@ -405,9 +412,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.acquireUploadSlot(r.Context()) {
-		s.enqueueUploadLog(UploadLog{APIKeyID: principal.ID, APIKeyName: principal.Name, IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: "上传并发已满"})
+		s.enqueueUploadLog(UploadLog{APIKeyID: principal.ID, APIKeyName: principal.Name, IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: "上传等待队列已满或等待超时"})
 		s.failedUploads.Add(1)
-		writeJSON(w, http.StatusTooManyRequests, 1, nil, "too many concurrent uploads")
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(s.cfg.UploadQueueTimeout/time.Second))))
+		writeJSON(w, http.StatusTooManyRequests, 1, nil, "upload queue is full or timed out")
 		return
 	}
 	defer s.releaseUploadSlot()
@@ -499,9 +507,32 @@ func (s *Server) acquireUploadSlot(ctx context.Context) bool {
 	case s.uploadSlots <- struct{}{}:
 		s.activeUploads.Add(1)
 		return true
+	default:
+	}
+	if cap(s.uploadQueue) <= 0 || s.cfg.UploadQueueTimeout <= 0 {
+		return false
+	}
+	select {
+	case s.uploadQueue <- struct{}{}:
+		s.queuedUploads.Add(1)
+		defer func() {
+			<-s.uploadQueue
+			s.queuedUploads.Add(-1)
+		}()
 	case <-ctx.Done():
 		return false
 	default:
+		return false
+	}
+	timer := time.NewTimer(s.cfg.UploadQueueTimeout)
+	defer timer.Stop()
+	select {
+	case s.uploadSlots <- struct{}{}:
+		s.activeUploads.Add(1)
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
 		return false
 	}
 }
@@ -633,13 +664,29 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, 1, nil, err.Error())
 		return
 	}
+	apiKeyCount, err := s.countAPIKeys(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, 1, nil, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, 0, map[string]any{
 		"images":        stats.ImageCount,
 		"bytes":         stats.TotalBytes,
 		"humanBytes":    formatBytes(stats.TotalBytes),
+		"maxUpload":     formatBytes(s.cfg.MaxUploadBytes),
+		"apiKeyCount":   apiKeyCount,
 		"settings":      settings,
 		"cleanupRuns":   s.cleanupRuns.Load(),
 		"cleanupErrors": s.cleanupErrors.Load(),
+		"uploads": map[string]any{
+			"active":              s.activeUploads.Load(),
+			"maxConcurrent":       s.cfg.MaxConcurrentUploads,
+			"queued":              s.queuedUploads.Load(),
+			"maxQueued":           s.cfg.MaxQueuedUploads,
+			"queueTimeoutSeconds": int(s.cfg.UploadQueueTimeout / time.Second),
+			"rateLimitKey":        formatRateLimit(s.cfg.UploadRateLimitPerKeyPerMinute),
+			"rateLimitIP":         formatRateLimit(s.cfg.UploadRateLimitPerIPPerMinute),
+		},
 	}, "ok")
 }
 
@@ -651,17 +698,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	_ = s.db.QueryRow(r.Context(), `select count(*) from storage_events`).Scan(&pendingEvents)
 	writeJSON(w, http.StatusOK, 0, map[string]any{
 		"uploads": map[string]any{
-			"active":        s.activeUploads.Load(),
-			"maxConcurrent": s.cfg.MaxConcurrentUploads,
-			"successTotal":  s.totalUploads.Load(),
-			"failedTotal":   s.failedUploads.Load(),
-			"rateLimitedTotal": s.rateLimitedUploads.Load(),
+			"active":                       s.activeUploads.Load(),
+			"maxConcurrent":                s.cfg.MaxConcurrentUploads,
+			"queued":                       s.queuedUploads.Load(),
+			"maxQueued":                    s.cfg.MaxQueuedUploads,
+			"queueTimeoutSeconds":          int(s.cfg.UploadQueueTimeout / time.Second),
+			"successTotal":                 s.totalUploads.Load(),
+			"failedTotal":                  s.failedUploads.Load(),
+			"rateLimitedTotal":             s.rateLimitedUploads.Load(),
 			"rateLimitPerKeyPerMinute": s.cfg.UploadRateLimitPerKeyPerMinute,
 			"rateLimitPerIPPerMinute":  s.cfg.UploadRateLimitPerIPPerMinute,
-			"logQueueLength": len(s.uploadLogQueue),
-			"logQueueCapacity": cap(s.uploadLogQueue),
-			"droppedLogTotal": s.droppedUploadLogs.Load(),
-			"successLogSamplePercent": s.cfg.SuccessUploadLogSamplePercent,
+			"logQueueLength":               len(s.uploadLogQueue),
+			"logQueueCapacity":             cap(s.uploadLogQueue),
+			"droppedLogTotal":              s.droppedUploadLogs.Load(),
+			"successLogSamplePercent":      s.cfg.SuccessUploadLogSamplePercent,
 		},
 		"cleanup": map[string]any{
 			"runs":   s.cleanupRuns.Load(),
@@ -787,6 +837,9 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		"MaxUpload":     formatBytes(s.cfg.MaxUploadBytes),
 		"ActiveUploads": s.activeUploads.Load(),
 		"MaxConcurrentUploads": s.cfg.MaxConcurrentUploads,
+		"QueuedUploads":        s.queuedUploads.Load(),
+		"MaxQueuedUploads":     s.cfg.MaxQueuedUploads,
+		"UploadQueueTimeout":   int(s.cfg.UploadQueueTimeout / time.Second),
 		"RateLimitKey": formatRateLimit(s.cfg.UploadRateLimitPerKeyPerMinute),
 		"RateLimitIP":  formatRateLimit(s.cfg.UploadRateLimitPerIPPerMinute),
 		"PublicBaseURL": s.cfg.PublicBaseURL,
@@ -1654,6 +1707,12 @@ func (s *Server) listAPIKeys(ctx context.Context) ([]APIKey, error) {
 	return items, rows.Err()
 }
 
+func (s *Server) countAPIKeys(ctx context.Context) (int, error) {
+	var count int
+	err := s.db.QueryRow(ctx, `select count(*) from api_keys`).Scan(&count)
+	return count, err
+}
+
 func (s *Server) listUploadLogs(ctx context.Context, limit int, beforeID int64) ([]UploadLog, error) {
 	query := `select id, coalesce(image_id, ''), coalesce(api_key_id, ''), api_key_name, original_name, size_bytes, mime_type, ip, user_agent, status, message, created_at
 		from upload_logs order by id desc limit $1`
@@ -2154,13 +2213,14 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 
 {{if eq .Page "overview"}}
 <div class="section-head"><h2>实时状态</h2><button type="button" class="secondary" data-refresh>刷新</button></div>
-<section class="grid">
-<div class="card"><div class="k">当前图片数</div><div class="v">{{.Stats.ImageCount}}</div></div>
-<div class="card"><div class="k">已用容量</div><div class="v">{{.TotalHuman}}</div></div>
-<div class="card"><div class="k">API 密钥数</div><div class="v">{{.APIKeyCount}}</div></div>
-<div class="card"><div class="k">单图上传上限</div><div class="v">{{.MaxUpload}}</div></div>
-<div class="card"><div class="k">正在处理的上传</div><div class="v">{{.ActiveUploads}} / {{.MaxConcurrentUploads}}</div></div>
-<div class="card"><div class="k">速率限制</div><div class="v" style="font-size:15px;line-height:1.7">Key {{.RateLimitKey}}<br>IP {{.RateLimitIP}}</div></div>
+<section class="grid" data-dashboard-cards>
+<div class="card"><div class="k">当前图片数</div><div class="v" data-stat="images">{{.Stats.ImageCount}}</div></div>
+<div class="card"><div class="k">已用容量</div><div class="v" data-stat="humanBytes">{{.TotalHuman}}</div></div>
+<div class="card"><div class="k">API 密钥数</div><div class="v" data-stat="apiKeyCount">{{.APIKeyCount}}</div></div>
+<div class="card"><div class="k">单图上传上限</div><div class="v" data-stat="maxUpload">{{.MaxUpload}}</div></div>
+<div class="card"><div class="k">正在处理的上传</div><div class="v"><span data-stat="uploads.active">{{.ActiveUploads}}</span> / <span data-stat="uploads.maxConcurrent">{{.MaxConcurrentUploads}}</span></div></div>
+<div class="card"><div class="k">等待队列</div><div class="v"><span data-stat="uploads.queued">{{.QueuedUploads}}</span> / <span data-stat="uploads.maxQueued">{{.MaxQueuedUploads}}</span></div></div>
+<div class="card"><div class="k">速率限制</div><div class="v" style="font-size:15px;line-height:1.7">Key <span data-stat="uploads.rateLimitKey">{{.RateLimitKey}}</span><br>IP <span data-stat="uploads.rateLimitIP">{{.RateLimitIP}}</span></div></div>
 </section>
 <section class="card">
 <h2>最近上传图片</h2>
@@ -2276,6 +2336,33 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 </main>
 </div>
 <script>
+function readPath(root, path) {
+  return path.split(".").reduce(function(value, key) {
+    return value && value[key] !== undefined ? value[key] : undefined;
+  }, root);
+}
+function setDashboardStat(path, value) {
+  const node = document.querySelector('[data-dashboard-cards] [data-stat="' + path + '"]');
+  if (!node || value === undefined || value === null) return;
+  node.textContent = value;
+}
+async function refreshDashboardCards() {
+  const cards = document.querySelector("[data-dashboard-cards]");
+  if (!cards) return;
+  try {
+    const response = await fetch("/api/status", {cache: "no-store", headers: {"X-Requested-With": "fetch"}});
+    if (!response.ok) return;
+    const payload = await response.json();
+    const data = payload && payload.data ? payload.data : {};
+    ["images", "humanBytes", "apiKeyCount", "maxUpload", "uploads.active", "uploads.maxConcurrent", "uploads.queued", "uploads.maxQueued", "uploads.rateLimitKey", "uploads.rateLimitIP"].forEach(function(path) {
+      setDashboardStat(path, readPath(data, path));
+    });
+  } catch (_) {}
+}
+if (document.querySelector("[data-dashboard-cards]")) {
+  refreshDashboardCards();
+  window.setInterval(refreshDashboardCards, 5000);
+}
 document.addEventListener("click", async function(event) {
   const button = event.target.closest("[data-refresh]");
   if (!button) return;
