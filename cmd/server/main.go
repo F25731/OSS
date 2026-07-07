@@ -288,8 +288,15 @@ func serveEmbeddedSVG(path string) http.HandlerFunc {
 			http.NotFound(w, r)
 			return
 		}
+		sum := sha256.Sum256(data)
+		etag := `"` + hex.EncodeToString(sum[:8]) + `"`
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 		w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
-		w.Header().Set("Cache-Control", "public, max-age=604800")
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		w.Header().Set("ETag", etag)
 		_, _ = w.Write(data)
 	}
 }
@@ -2019,6 +2026,8 @@ const loginTemplate = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>知梦图床 登录</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="/favicon.svg" as="image" type="image/svg+xml">
+<link rel="preload" href="/assets/zm.svg" as="image" type="image/svg+xml">
 <style>
 body{margin:0;font-family:Inter,Arial,sans-serif;background:#f5f7fb;color:#172033;display:grid;place-items:center;min-height:100vh}
 .box{width:min(360px,calc(100vw - 32px));background:#fff;border:1px solid #dce3ee;border-radius:8px;padding:24px;box-shadow:0 18px 50px #20305018}
@@ -2047,6 +2056,8 @@ const loginTemplateV2 = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>知梦图床 登录</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="/favicon.svg" as="image" type="image/svg+xml">
+<link rel="preload" href="/assets/zm.svg" as="image" type="image/svg+xml">
 <style>
 body{margin:0;font-family:Inter,Arial,"Microsoft YaHei",sans-serif;background:#f5f7fb;color:#172033;display:grid;place-items:center;min-height:100vh}
 .box{width:min(360px,calc(100vw - 32px));background:#fff;border:1px solid #dce3ee;border-radius:8px;padding:24px;box-shadow:0 18px 50px #20305018}
@@ -2075,6 +2086,8 @@ const adminTemplateV2 = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>知梦图床 后台</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="/favicon.svg" as="image" type="image/svg+xml">
+<link rel="preload" href="/assets/zm.svg" as="image" type="image/svg+xml">
 <style>
 *{box-sizing:border-box}
 body{margin:0;font-family:Inter,Arial,"Microsoft YaHei",sans-serif;background:#f4f7fb;color:#172033}
@@ -2122,7 +2135,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <body>
 <div class="layout">
 <aside class="side">
-<div class="brand"><img src="/assets/zm.svg" alt="知梦图床"><span>知梦图床</span></div>
+<div class="brand"><img src="/assets/zm.svg" width="28" height="28" alt="" aria-hidden="true" decoding="sync" fetchpriority="high"><span>知梦图床</span></div>
 <nav class="nav">
 <a class="{{if eq .Page "overview"}}active{{end}}" href="/fyanxv">概览</a>
 <a class="{{if eq .Page "images"}}active{{end}}" href="/fyanxv/images">图片管理</a>
@@ -2146,7 +2159,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <div class="card"><div class="k">已用容量</div><div class="v">{{.TotalHuman}}</div></div>
 <div class="card"><div class="k">API 密钥数</div><div class="v">{{.APIKeyCount}}</div></div>
 <div class="card"><div class="k">单图上传上限</div><div class="v">{{.MaxUpload}}</div></div>
-<div class="card"><div class="k">活跃上传</div><div class="v">{{.ActiveUploads}} / {{.MaxConcurrentUploads}}</div></div>
+<div class="card"><div class="k">正在处理的上传</div><div class="v">{{.ActiveUploads}} / {{.MaxConcurrentUploads}}</div></div>
 <div class="card"><div class="k">速率限制</div><div class="v" style="font-size:15px;line-height:1.7">Key {{.RateLimitKey}}<br>IP {{.RateLimitIP}}</div></div>
 </section>
 <section class="card">
@@ -2294,6 +2307,8 @@ const adminTemplate = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>知梦图床 后台</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="/favicon.svg" as="image" type="image/svg+xml">
+<link rel="preload" href="/assets/zm.svg" as="image" type="image/svg+xml">
 <style>
 body{margin:0;font-family:Inter,Arial,sans-serif;background:#f5f7fb;color:#172033}
 header{height:56px;background:#111827;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 24px}
