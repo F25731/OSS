@@ -269,7 +269,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /fyanxv/settings", s.requireAdmin(s.handleSettings))
 	mux.HandleFunc("POST /fyanxv/settings", s.requireAdmin(s.handleSettingsUpdate))
 	mux.HandleFunc("POST /fyanxv/cleanup", s.requireAdmin(s.handleCleanupNow))
-	mux.Handle("/i/", http.StripPrefix("/i/", noListFileServer{s.cfg.StorageDir}))
+	mux.Handle("GET /i/", http.StripPrefix("/i/", noListFileServer{s.cfg.StorageDir}))
 	return logRequests(mux)
 }
 
