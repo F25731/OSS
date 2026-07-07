@@ -22,10 +22,9 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "${HOST_PORT:-8080}:8080"
+      - "${HOST_BIND:-127.0.0.1}:${HOST_PORT:-8080}:8080"
     volumes:
-      - images:/data/image-bed/images
+      - ${IMAGE_STORAGE_HOST_DIR:-/opt/ai-image-bed/images}:/data/image-bed/images
 
 volumes:
   pgdata:
-  images:

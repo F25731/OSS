@@ -1,4 +1,4 @@
-# AI Image Bed
+# 知梦图床
 
 A small self-hosted image bed for AI reference images.
 
@@ -69,6 +69,11 @@ Response:
 | `STORAGE_DIR` | `./data/images` | Image files are stored here. |
 | `PUBLIC_BASE_URL` | `http://localhost:8080` | Prefix used for returned image URLs. |
 | `MAX_UPLOAD_MB` | `50` | Single image upload limit. |
+| `MAX_CONCURRENT_UPLOADS` | CPU-based, at least 8 | Maximum concurrent uploads accepted by the Go service. |
+| `UPLOAD_RATE_LIMIT_PER_KEY_PER_MINUTE` | `0` | Per-key upload rate limit. `0` means unlimited. |
+| `UPLOAD_RATE_LIMIT_PER_IP_PER_MINUTE` | `0` | Per-IP upload rate limit. `0` means unlimited. |
+| `UPLOAD_LOG_QUEUE_SIZE` | `4096` | Async upload log queue size. Full queues drop log rows, not uploads. |
+| `SUCCESS_UPLOAD_LOG_SAMPLE_PERCENT` | `100` | Successful upload log sampling percent. `0` logs failures only. |
 | `ADMIN_USER` | `Fyanxv` | Admin login username. |
 | `ADMIN_PASSWORD` | `Fyb2530+` | Change in production. |
 | `SESSION_SECRET` | random per boot | Set a stable random string in production. |

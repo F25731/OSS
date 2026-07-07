@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"crypto/hmac"
-	"crypto/rand"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,40 +11,78 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"io/fs"
 	"log"
+	"math/rand"
 	"mime/multipart"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	imageassets "ai-image-bed/internal/assets"
+	imagemigrations "ai-image-bed/internal/migrations"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Config struct {
-	ListenAddr       string
-	DatabaseURL      string
-	DBMaxConns       int32
-	StorageDir       string
-	PublicBaseURL    string
-	MaxUploadBytes   int64
-	AdminUser        string
-	AdminPassword    string
-	SessionSecret    string
-	UploadKeys       map[string]string
-	CORSAllowOrigins []string
+	ListenAddr                     string
+	DatabaseURL                    string
+	DBMaxConns                     int32
+	StorageDir                     string
+	PublicBaseURL                  string
+	MaxUploadBytes                 int64
+	MaxConcurrentUploads           int
+	UploadRateLimitPerKeyPerMinute int
+	UploadRateLimitPerIPPerMinute  int
+	UploadLogQueueSize             int
+	SuccessUploadLogSamplePercent  int
+	AdminUser                      string
+	AdminPassword                  string
+	SessionSecret                  string
+	UploadKeys                     map[string]string
+	CORSAllowOrigins               []string
 }
 
 type Server struct {
-	cfg          Config
-	db           *pgxpool.Pool
-	cleanupRuns  atomic.Int64
-	cleanupErrors atomic.Int64
+	cfg              Config
+	db               *pgxpool.Pool
+	cleanupRuns      atomic.Int64
+	cleanupErrors    atomic.Int64
+	cleanupActive    atomic.Bool
+	statsFlushActive atomic.Bool
+	apiKeyLastUsed   sync.Map
+	uploadSlots      chan struct{}
+	activeUploads    atomic.Int64
+	totalUploads     atomic.Int64
+	failedUploads    atomic.Int64
+	rateLimitedUploads atomic.Int64
+	rateMu           sync.Mutex
+	rateWindows      map[string]rateWindow
+	uploadLogQueue   chan UploadLog
+	droppedUploadLogs atomic.Int64
+	loginMu          sync.Mutex
+	loginAttempts    map[string]loginAttempt
+}
+
+type rateWindow struct {
+	Count int
+	Reset time.Time
+}
+
+type loginAttempt struct {
+	Failures     int
+	FirstFailure time.Time
+	BlockedUntil time.Time
 }
 
 type ImageRecord struct {
@@ -134,31 +172,41 @@ type JSONResponse struct {
 }
 
 func main() {
+	log.SetFlags(0)
 	cfg := loadConfig()
 	if err := os.MkdirAll(cfg.StorageDir, 0755); err != nil {
-		log.Fatalf("create storage dir: %v", err)
+		fatalEvent("storage_dir_create_failed", err, map[string]any{"storage": cfg.StorageDir})
 	}
 
 	ctx := context.Background()
 	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
-		log.Fatalf("parse postgres config: %v", err)
+		fatalEvent("postgres_config_parse_failed", err, nil)
 	}
 	poolCfg.MaxConns = cfg.DBMaxConns
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
-		log.Fatalf("connect postgres: %v", err)
+		fatalEvent("postgres_connect_failed", err, nil)
 	}
 	defer pool.Close()
 
-	srv := &Server{cfg: cfg, db: pool}
+	srv := &Server{
+		cfg: cfg,
+		db: pool,
+		uploadSlots: make(chan struct{}, cfg.MaxConcurrentUploads),
+		rateWindows: map[string]rateWindow{},
+		uploadLogQueue: make(chan UploadLog, cfg.UploadLogQueueSize),
+		loginAttempts: map[string]loginAttempt{},
+	}
 	if err := srv.migrate(ctx); err != nil {
-		log.Fatalf("migrate database: %v", err)
+		fatalEvent("database_migrate_failed", err, nil)
 	}
 
 	go srv.cleanupLoop()
+	go srv.statsLoop()
+	go srv.uploadLogLoop()
 
-	log.Printf("image bed listening on %s, storage=%s", cfg.ListenAddr, cfg.StorageDir)
+	logEvent("info", "server_start", map[string]any{"listen": cfg.ListenAddr, "storage": cfg.StorageDir})
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           srv.routes(),
@@ -169,7 +217,7 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 	if err := httpServer.ListenAndServe(); err != nil {
-		log.Fatal(err)
+		fatalEvent("server_stopped", err, nil)
 	}
 }
 
@@ -182,6 +230,11 @@ func loadConfig() Config {
 		StorageDir:       filepath.Clean(env("STORAGE_DIR", "./data/images")),
 		PublicBaseURL:    strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
 		MaxUploadBytes:   int64(maxMB) * 1024 * 1024,
+		MaxConcurrentUploads: envInt("MAX_CONCURRENT_UPLOADS", max(8, runtime.NumCPU()*4)),
+		UploadRateLimitPerKeyPerMinute: envIntAllowZero("UPLOAD_RATE_LIMIT_PER_KEY_PER_MINUTE", 0),
+		UploadRateLimitPerIPPerMinute:  envIntAllowZero("UPLOAD_RATE_LIMIT_PER_IP_PER_MINUTE", 0),
+		UploadLogQueueSize:             envInt("UPLOAD_LOG_QUEUE_SIZE", 4096),
+		SuccessUploadLogSamplePercent:  clampInt(envIntAllowZero("SUCCESS_UPLOAD_LOG_SAMPLE_PERCENT", 100), 0, 100),
 		AdminUser:        env("ADMIN_USER", "Fyanxv"),
 		AdminPassword:    env("ADMIN_PASSWORD", "Fyb2530+"),
 		SessionSecret:    env("SESSION_SECRET", randomHex(32)),
@@ -192,10 +245,15 @@ func loadConfig() Config {
 
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /", s.handleRoot)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /assets/zm.svg", serveEmbeddedSVG("public/zm.svg"))
+	mux.HandleFunc("GET /favicon.svg", serveEmbeddedSVG("public/zm.svg"))
+	mux.HandleFunc("GET /favicon.ico", serveEmbeddedSVG("public/zm.svg"))
 	mux.HandleFunc("POST /api/upload", s.withCORS(s.handleUpload))
 	mux.HandleFunc("OPTIONS /api/upload", s.withCORS(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	mux.HandleFunc("GET /api/status", s.requireAdmin(s.handleAPIStatus))
+	mux.HandleFunc("GET /api/metrics", s.requireAdmin(s.handleMetrics))
 	mux.HandleFunc("GET /fyanxv/login", s.handleLoginPage)
 	mux.HandleFunc("POST /fyanxv/login", s.handleLogin)
 	mux.HandleFunc("POST /fyanxv/logout", s.requireAdmin(s.handleLogout))
@@ -211,85 +269,104 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /fyanxv/settings", s.requireAdmin(s.handleSettings))
 	mux.HandleFunc("POST /fyanxv/settings", s.requireAdmin(s.handleSettingsUpdate))
 	mux.HandleFunc("POST /fyanxv/cleanup", s.requireAdmin(s.handleCleanupNow))
-	mux.Handle("/i/", http.StripPrefix("/i/", http.FileServer(http.Dir(s.cfg.StorageDir))))
+	mux.Handle("/i/", http.StripPrefix("/i/", noListFileServer{s.cfg.StorageDir}))
 	return logRequests(mux)
 }
 
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	http.Redirect(w, r, "/fyanxv", http.StatusFound)
+}
+
+func serveEmbeddedSVG(path string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		data, err := fs.ReadFile(imageassets.Files, path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=604800")
+		_, _ = w.Write(data)
+	}
+}
+
+type noListFileServer struct {
+	root string
+}
+
+func (s noListFileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	clean := path.Clean("/" + r.URL.Path)
+	if clean == "/" || strings.HasSuffix(r.URL.Path, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	fullPath := filepath.Join(s.root, filepath.FromSlash(strings.TrimPrefix(clean, "/")))
+	rootAbs, err := filepath.Abs(s.root)
+	if err != nil {
+		http.Error(w, "invalid storage root", http.StatusInternalServerError)
+		return
+	}
+	fullAbs, err := filepath.Abs(fullPath)
+	if err != nil || (fullAbs != rootAbs && !strings.HasPrefix(fullAbs, rootAbs+string(os.PathSeparator))) {
+		http.NotFound(w, r)
+		return
+	}
+	info, err := os.Stat(fullAbs)
+	if err != nil || info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeFile(w, r, fullAbs)
+}
+
 func (s *Server) migrate(ctx context.Context) error {
-	stmts := []string{
-		`create table if not exists images (
-			id text primary key,
-			public_path text not null unique,
-			file_path text not null unique,
-			original_name text not null,
-			size_bytes bigint not null,
-			mime_type text not null,
-			sha256 text not null,
-			api_key_id text,
-			api_key_name text not null,
-			created_at timestamptz not null default now(),
-			deleted_at timestamptz
-		)`,
-		`alter table images add column if not exists api_key_id text`,
-		`create index if not exists images_active_created_at_idx on images (created_at) where deleted_at is null`,
-		`create index if not exists images_sha256_idx on images (sha256)`,
-		`create index if not exists images_api_key_id_idx on images (api_key_id) where deleted_at is null`,
-		`create table if not exists api_keys (
-			id text primary key,
-			name text not null,
-			key_hash text not null unique,
-			prefix text not null,
-			enabled boolean not null default true,
-			created_at timestamptz not null default now(),
-			last_used_at timestamptz
-		)`,
-		`create index if not exists api_keys_enabled_idx on api_keys (enabled)`,
-		`create table if not exists upload_logs (
-			id bigserial primary key,
-			image_id text,
-			api_key_id text,
-			api_key_name text not null default '',
-			original_name text not null default '',
-			size_bytes bigint not null default 0,
-			mime_type text not null default '',
-			ip text not null default '',
-			user_agent text not null default '',
-			status text not null,
-			message text not null default '',
-			created_at timestamptz not null default now()
-		)`,
-		`create index if not exists upload_logs_created_at_idx on upload_logs (created_at desc)`,
-		`create index if not exists upload_logs_api_key_id_idx on upload_logs (api_key_id)`,
-		`create table if not exists storage_stats (
-			id int primary key check (id = 1),
-			image_count bigint not null default 0,
-			total_bytes bigint not null default 0,
-			updated_at timestamptz not null default now()
-		)`,
-		`insert into storage_stats (id, image_count, total_bytes) values (1, 0, 0) on conflict (id) do nothing`,
-		`create table if not exists settings (
-			key text primary key,
-			value text not null
-		)`,
+	if _, err := s.db.Exec(ctx, `create table if not exists schema_migrations (
+		version text primary key,
+		applied_at timestamptz not null default now()
+	)`); err != nil {
+		return err
 	}
-	for _, stmt := range stmts {
-		if _, err := s.db.Exec(ctx, stmt); err != nil {
+	entries, err := fs.ReadDir(imagemigrations.Files, "sql")
+	if err != nil {
+		return err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		version := strings.TrimSuffix(entry.Name(), ".sql")
+		var applied bool
+		if err := s.db.QueryRow(ctx, `select exists (select 1 from schema_migrations where version = $1)`, version).Scan(&applied); err != nil {
 			return err
 		}
-	}
-	defaults := map[string]string{
-		"retention_days":           "7",
-		"capacity_gb":              "100",
-		"trim_gb":                  "30",
-		"cleanup_interval_minutes": "10",
-		"cleanup_batch_size":       "1000",
-		"log_retention_days":       "30",
-		"deleted_record_retention_days": "7",
-	}
-	for key, value := range defaults {
-		if _, err := s.db.Exec(ctx, `insert into settings (key, value) values ($1, $2) on conflict (key) do nothing`, key, value); err != nil {
+		if applied {
+			continue
+		}
+		sqlBytes, err := fs.ReadFile(imagemigrations.Files, "sql/"+entry.Name())
+		if err != nil {
 			return err
 		}
+		tx, err := s.db.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, string(sqlBytes)); err != nil {
+			_ = tx.Rollback(ctx)
+			return fmt.Errorf("apply migration %s: %w", version, err)
+		}
+		if _, err := tx.Exec(ctx, `insert into schema_migrations (version) values ($1)`, version); err != nil {
+			_ = tx.Rollback(ctx)
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+		logEvent("info", "migration_applied", map[string]any{"version": version})
 	}
 	if err := s.seedEnvAPIKeys(ctx); err != nil {
 		return err
@@ -308,14 +385,31 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	principal, ok := s.checkUploadAuth(r)
 	if !ok {
-		_ = s.writeUploadLog(r.Context(), UploadLog{IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: "密钥无效"})
+		s.enqueueUploadLog(UploadLog{IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: "密钥无效"})
+		s.failedUploads.Add(1)
 		writeJSON(w, http.StatusUnauthorized, 1, nil, "missing or invalid upload api key")
 		return
 	}
+	if reason, ok := s.allowUploadRate(principal, clientIP(r)); !ok {
+		s.enqueueUploadLog(UploadLog{APIKeyID: principal.ID, APIKeyName: principal.Name, IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: reason})
+		s.failedUploads.Add(1)
+		s.rateLimitedUploads.Add(1)
+		writeJSON(w, http.StatusTooManyRequests, 1, nil, reason)
+		return
+	}
+	if !s.acquireUploadSlot(r.Context()) {
+		s.enqueueUploadLog(UploadLog{APIKeyID: principal.ID, APIKeyName: principal.Name, IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: "上传并发已满"})
+		s.failedUploads.Add(1)
+		writeJSON(w, http.StatusTooManyRequests, 1, nil, "too many concurrent uploads")
+		return
+	}
+	defer s.releaseUploadSlot()
+
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUploadBytes+1024*1024)
 	reader, err := r.MultipartReader()
 	if err != nil {
-		_ = s.writeUploadLog(r.Context(), UploadLog{APIKeyID: principal.ID, APIKeyName: principal.Name, IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: "请求必须是 multipart/form-data"})
+		s.enqueueUploadLog(UploadLog{APIKeyID: principal.ID, APIKeyName: principal.Name, IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: "请求必须是 multipart/form-data"})
+		s.failedUploads.Add(1)
 		writeJSON(w, http.StatusBadRequest, 1, nil, "expected multipart/form-data")
 		return
 	}
@@ -327,6 +421,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if err != nil {
+			s.failedUploads.Add(1)
 			writeJSON(w, http.StatusBadRequest, 1, nil, "failed to read multipart body")
 			return
 		}
@@ -337,19 +432,79 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		uploaded, err = s.saveMultipartImage(r.Context(), part, principal)
 		_ = part.Close()
 		if err != nil {
-			_ = s.writeUploadLog(r.Context(), UploadLog{APIKeyID: principal.ID, APIKeyName: principal.Name, OriginalName: part.FileName(), IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: err.Error()})
+			s.enqueueUploadLog(UploadLog{APIKeyID: principal.ID, APIKeyName: principal.Name, OriginalName: part.FileName(), IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: err.Error()})
+			s.failedUploads.Add(1)
 			writeJSON(w, http.StatusBadRequest, 1, nil, err.Error())
 			return
 		}
 		break
 	}
 	if uploaded == nil {
-		_ = s.writeUploadLog(r.Context(), UploadLog{APIKeyID: principal.ID, APIKeyName: principal.Name, IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: "缺少 file 字段"})
+		s.enqueueUploadLog(UploadLog{APIKeyID: principal.ID, APIKeyName: principal.Name, IP: clientIP(r), UserAgent: r.UserAgent(), Status: "failed", Message: "缺少 file 字段"})
+		s.failedUploads.Add(1)
 		writeJSON(w, http.StatusBadRequest, 1, nil, "multipart field file is required")
 		return
 	}
-	_ = s.writeUploadLog(r.Context(), UploadLog{ImageID: uploaded.ID, APIKeyID: uploaded.APIKeyID, APIKeyName: uploaded.APIKeyName, OriginalName: uploaded.OriginalName, SizeBytes: uploaded.SizeBytes, MimeType: uploaded.MimeType, IP: clientIP(r), UserAgent: r.UserAgent(), Status: "success", Message: uploaded.URL})
+	s.enqueueUploadLog(UploadLog{ImageID: uploaded.ID, APIKeyID: uploaded.APIKeyID, APIKeyName: uploaded.APIKeyName, OriginalName: uploaded.OriginalName, SizeBytes: uploaded.SizeBytes, MimeType: uploaded.MimeType, IP: clientIP(r), UserAgent: r.UserAgent(), Status: "success", Message: uploaded.URL})
+	s.totalUploads.Add(1)
 	writeJSON(w, http.StatusOK, 0, uploaded, "ok")
+}
+
+func (s *Server) allowUploadRate(principal UploadPrincipal, ip string) (string, bool) {
+	if s.cfg.UploadRateLimitPerIPPerMinute > 0 && !s.allowRate("ip:"+ip, s.cfg.UploadRateLimitPerIPPerMinute, time.Minute) {
+		return "upload rate limit exceeded for ip", false
+	}
+	if s.cfg.UploadRateLimitPerKeyPerMinute > 0 && !s.allowRate("key:"+principal.ID, s.cfg.UploadRateLimitPerKeyPerMinute, time.Minute) {
+		return "upload rate limit exceeded for api key", false
+	}
+	return "", true
+}
+
+func (s *Server) allowRate(key string, limit int, windowSize time.Duration) bool {
+	if limit <= 0 {
+		return true
+	}
+	now := time.Now()
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	window := s.rateWindows[key]
+	if window.Reset.IsZero() || now.After(window.Reset) {
+		window = rateWindow{Reset: now.Add(windowSize)}
+	}
+	if window.Count >= limit {
+		s.rateWindows[key] = window
+		return false
+	}
+	window.Count++
+	s.rateWindows[key] = window
+	if len(s.rateWindows) > 2048 {
+		for itemKey, item := range s.rateWindows {
+			if now.After(item.Reset) {
+				delete(s.rateWindows, itemKey)
+			}
+		}
+	}
+	return true
+}
+
+func (s *Server) acquireUploadSlot(ctx context.Context) bool {
+	select {
+	case s.uploadSlots <- struct{}{}:
+		s.activeUploads.Add(1)
+		return true
+	case <-ctx.Done():
+		return false
+	default:
+		return false
+	}
+}
+
+func (s *Server) releaseUploadSlot() {
+	select {
+	case <-s.uploadSlots:
+		s.activeUploads.Add(-1)
+	default:
+	}
 }
 
 func (s *Server) saveMultipartImage(ctx context.Context, part *multipart.Part, principal UploadPrincipal) (*ImageRecord, error) {
@@ -451,11 +606,10 @@ func (s *Server) insertImage(ctx context.Context, img *ImageRecord) error {
 	if err != nil {
 		return err
 	}
-	if img.APIKeyID != "" {
+	if img.APIKeyID != "" && s.shouldTouchAPIKey(img.APIKeyID) {
 		_, _ = tx.Exec(ctx, `update api_keys set last_used_at = now() where id = $1`, img.APIKeyID)
 	}
-	_, err = tx.Exec(ctx, `update storage_stats set image_count = image_count + 1, total_bytes = total_bytes + $1, updated_at = now() where id = 1`, img.SizeBytes)
-	if err != nil {
+	if err := recordStorageEventTx(ctx, tx, 1, img.SizeBytes); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -482,6 +636,52 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	}, "ok")
 }
 
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	dbStats := s.db.Stat()
+	var pendingEvents int64
+	_ = s.db.QueryRow(r.Context(), `select count(*) from storage_events`).Scan(&pendingEvents)
+	writeJSON(w, http.StatusOK, 0, map[string]any{
+		"uploads": map[string]any{
+			"active":        s.activeUploads.Load(),
+			"maxConcurrent": s.cfg.MaxConcurrentUploads,
+			"successTotal":  s.totalUploads.Load(),
+			"failedTotal":   s.failedUploads.Load(),
+			"rateLimitedTotal": s.rateLimitedUploads.Load(),
+			"rateLimitPerKeyPerMinute": s.cfg.UploadRateLimitPerKeyPerMinute,
+			"rateLimitPerIPPerMinute":  s.cfg.UploadRateLimitPerIPPerMinute,
+			"logQueueLength": len(s.uploadLogQueue),
+			"logQueueCapacity": cap(s.uploadLogQueue),
+			"droppedLogTotal": s.droppedUploadLogs.Load(),
+			"successLogSamplePercent": s.cfg.SuccessUploadLogSamplePercent,
+		},
+		"cleanup": map[string]any{
+			"runs":   s.cleanupRuns.Load(),
+			"errors": s.cleanupErrors.Load(),
+			"active": s.cleanupActive.Load(),
+		},
+		"storageEvents": map[string]any{
+			"pending": pendingEvents,
+		},
+		"database": map[string]any{
+			"acquiredConns":        dbStats.AcquiredConns(),
+			"constructingConns":    dbStats.ConstructingConns(),
+			"idleConns":            dbStats.IdleConns(),
+			"maxConns":             dbStats.MaxConns(),
+			"totalConns":           dbStats.TotalConns(),
+			"emptyAcquireWaitTime": dbStats.EmptyAcquireWaitTime().String(),
+		},
+		"memory": map[string]any{
+			"allocBytes":      mem.Alloc,
+			"heapAllocBytes":  mem.HeapAlloc,
+			"heapInuseBytes":  mem.HeapInuse,
+			"numGC":           mem.NumGC,
+			"goroutines":      runtime.NumGoroutine(),
+		},
+	}, "ok")
+}
+
 func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 	if s.validSession(r) {
 		http.Redirect(w, r, "/fyanxv", http.StatusFound)
@@ -491,14 +691,21 @@ func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	if wait, ok := s.loginAllowed(ip); !ok {
+		render(w, loginTemplateV2, map[string]any{"Error": fmt.Sprintf("登录失败过多，请 %s 后再试", wait.Round(time.Second))})
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		render(w, loginTemplateV2, map[string]any{"Error": "表单无效"})
 		return
 	}
 	if r.FormValue("username") != s.cfg.AdminUser || r.FormValue("password") != s.cfg.AdminPassword {
+		s.recordLoginFailure(ip)
 		render(w, loginTemplateV2, map[string]any{"Error": "用户名或密码错误"})
 		return
 	}
+	s.clearLoginFailures(ip)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "image_bed_session",
 		Value:    s.signSession(time.Now().Add(24 * time.Hour).Unix()),
@@ -507,6 +714,38 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 	})
 	http.Redirect(w, r, "/fyanxv", http.StatusFound)
+}
+
+func (s *Server) loginAllowed(ip string) (time.Duration, bool) {
+	now := time.Now()
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	attempt, ok := s.loginAttempts[ip]
+	if !ok || attempt.BlockedUntil.IsZero() || now.After(attempt.BlockedUntil) {
+		return 0, true
+	}
+	return time.Until(attempt.BlockedUntil), false
+}
+
+func (s *Server) recordLoginFailure(ip string) {
+	now := time.Now()
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	attempt := s.loginAttempts[ip]
+	if attempt.FirstFailure.IsZero() || now.Sub(attempt.FirstFailure) > 15*time.Minute {
+		attempt = loginAttempt{FirstFailure: now}
+	}
+	attempt.Failures++
+	if attempt.Failures >= 5 {
+		attempt.BlockedUntil = now.Add(15 * time.Minute)
+	}
+	s.loginAttempts[ip] = attempt
+}
+
+func (s *Server) clearLoginFailures(ip string) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	delete(s.loginAttempts, ip)
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -531,11 +770,15 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	renderAdmin(w, "overview", map[string]any{
+	s.renderAdmin(w, r, "overview", map[string]any{
 		"Stats":         stats,
 		"Recent":        recent,
 		"TotalHuman":    formatBytes(stats.TotalBytes),
 		"MaxUpload":     formatBytes(s.cfg.MaxUploadBytes),
+		"ActiveUploads": s.activeUploads.Load(),
+		"MaxConcurrentUploads": s.cfg.MaxConcurrentUploads,
+		"RateLimitKey": formatRateLimit(s.cfg.UploadRateLimitPerKeyPerMinute),
+		"RateLimitIP":  formatRateLimit(s.cfg.UploadRateLimitPerIPPerMinute),
 		"PublicBaseURL": s.cfg.PublicBaseURL,
 		"CleanupRuns":   s.cleanupRuns.Load(),
 		"CleanupErrors": s.cleanupErrors.Load(),
@@ -544,29 +787,30 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
-	page := pageFromRequest(r)
 	filter := ImageFilter{
 		Query: r.URL.Query().Get("q"),
 		From:  r.URL.Query().Get("from"),
 		To:    r.URL.Query().Get("to"),
 		KeyID: r.URL.Query().Get("key_id"),
 	}
-	images, err := s.searchImages(r.Context(), filter, adminPageSize+1, (page-1)*adminPageSize)
+	images, err := s.searchImages(r.Context(), filter, adminPageSize+1, r.URL.Query().Get("cursor"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	hasNext := len(images) > adminPageSize
+	nextCursor := ""
 	if hasNext {
 		images = images[:adminPageSize]
+		nextCursor = imageCursor(images[len(images)-1])
 	}
-	pagination := buildPagination(r, page, adminPageSize, hasNext)
+	pagination := buildCursorPagination(r, adminPageSize, nextCursor)
 	keys, err := s.listAPIKeys(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	renderAdmin(w, "images", map[string]any{"Images": images, "Filter": filter, "Keys": keys, "Pagination": pagination})
+	s.renderAdmin(w, r, "images", map[string]any{"Images": images, "Filter": filter, "Keys": keys, "Pagination": pagination})
 }
 
 func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
@@ -592,9 +836,9 @@ func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	renderAdmin(w, "api_keys", map[string]any{
+	s.renderAdmin(w, r, "api_keys", map[string]any{
 		"Keys":       keys,
-		"CreatedKey": r.URL.Query().Get("created_key"),
+		"CreatedKey": "",
 	})
 }
 
@@ -614,7 +858,15 @@ func (s *Server) handleAPIKeyCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	http.Redirect(w, r, "/fyanxv/api-keys?created_key="+raw, http.StatusFound)
+	keys, err := s.listAPIKeys(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.renderAdmin(w, r, "api_keys", map[string]any{
+		"Keys":       keys,
+		"CreatedKey": raw,
+	})
 }
 
 func (s *Server) handleAPIKeyToggle(w http.ResponseWriter, r *http.Request) {
@@ -646,18 +898,20 @@ func (s *Server) handleAPIKeyDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
-	page := pageFromRequest(r)
-	logs, err := s.listUploadLogs(r.Context(), adminPageSize+1, (page-1)*adminPageSize)
+	cursor, _ := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("cursor")), 10, 64)
+	logs, err := s.listUploadLogs(r.Context(), adminPageSize+1, cursor)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	hasNext := len(logs) > adminPageSize
+	nextCursor := ""
 	if hasNext {
 		logs = logs[:adminPageSize]
+		nextCursor = strconv.FormatInt(logs[len(logs)-1].ID, 10)
 	}
-	pagination := buildPagination(r, page, adminPageSize, hasNext)
-	renderAdmin(w, "logs", map[string]any{"Logs": logs, "Pagination": pagination})
+	pagination := buildCursorPagination(r, adminPageSize, nextCursor)
+	s.renderAdmin(w, r, "logs", map[string]any{"Logs": logs, "Pagination": pagination})
 }
 
 func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
@@ -666,7 +920,12 @@ func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	renderAdmin(w, "docs", map[string]any{"PublicBaseURL": s.cfg.PublicBaseURL, "Keys": keys})
+	s.renderAdmin(w, r, "docs", map[string]any{
+		"PublicBaseURL": s.cfg.PublicBaseURL,
+		"Keys": keys,
+		"RateLimitKey": formatRateLimit(s.cfg.UploadRateLimitPerKeyPerMinute),
+		"RateLimitIP":  formatRateLimit(s.cfg.UploadRateLimitPerIPPerMinute),
+	})
 }
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -675,10 +934,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	renderAdmin(w, "settings", map[string]any{
+	s.renderAdmin(w, r, "settings", map[string]any{
 		"Settings":      settings,
 		"CapacityHuman": fmt.Sprintf("%d GB", settings.CapacityGB),
 		"MaxUpload":     formatBytes(s.cfg.MaxUploadBytes),
+		"RateLimitKey":  formatRateLimit(s.cfg.UploadRateLimitPerKeyPerMinute),
+		"RateLimitIP":   formatRateLimit(s.cfg.UploadRateLimitPerIPPerMinute),
 		"PublicBaseURL": s.cfg.PublicBaseURL,
 		"CleanupRuns":   s.cleanupRuns.Load(),
 		"CleanupErrors": s.cleanupErrors.Load(),
@@ -712,7 +973,7 @@ func (s *Server) handleCleanupNow(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	log.Printf("manual cleanup: deleted=%d freed=%s", result.Deleted, formatBytes(result.FreedBytes))
+	logEvent("info", "manual_cleanup", map[string]any{"deleted": result.Deleted, "freed_bytes": result.FreedBytes})
 	http.Redirect(w, r, "/fyanxv/settings", http.StatusFound)
 }
 
@@ -720,6 +981,80 @@ func (s *Server) readStats(ctx context.Context) (Stats, error) {
 	var stats Stats
 	err := s.db.QueryRow(ctx, `select image_count, total_bytes from storage_stats where id = 1`).Scan(&stats.ImageCount, &stats.TotalBytes)
 	return stats, err
+}
+
+func (s *Server) statsLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if err := s.flushStorageEvents(context.Background(), 10000); err != nil {
+			logEvent("error", "storage_events_flush_failed", map[string]any{"error": err.Error()})
+		}
+	}
+}
+
+func (s *Server) flushStorageEvents(ctx context.Context, batchSize int) error {
+	if batchSize <= 0 {
+		batchSize = 10000
+	}
+	if !s.statsFlushActive.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer s.statsFlushActive.Store(false)
+
+	for {
+		tx, err := s.db.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		var rows int64
+		var deltaCount int64
+		var deltaBytes int64
+		err = tx.QueryRow(ctx, `with moved as (
+			delete from storage_events
+			where id in (select id from storage_events order by id asc limit $1)
+			returning delta_count, delta_bytes
+		)
+		select count(*), coalesce(sum(delta_count), 0), coalesce(sum(delta_bytes), 0) from moved`, batchSize).Scan(&rows, &deltaCount, &deltaBytes)
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			return err
+		}
+		if rows == 0 {
+			return tx.Commit(ctx)
+		}
+		if _, err := tx.Exec(ctx, `update storage_stats
+			set image_count = greatest(image_count + $1, 0::bigint),
+				total_bytes = greatest(total_bytes + $2, 0::bigint),
+				updated_at = now()
+			where id = 1`, deltaCount, deltaBytes); err != nil {
+			_ = tx.Rollback(ctx)
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return err
+		}
+		if rows < int64(batchSize) {
+			return nil
+		}
+	}
+}
+
+func recordStorageEventTx(ctx context.Context, tx pgx.Tx, deltaCount int64, deltaBytes int64) error {
+	_, err := tx.Exec(ctx, `insert into storage_events (delta_count, delta_bytes) values ($1, $2)`, deltaCount, deltaBytes)
+	return err
+}
+
+func (s *Server) shouldTouchAPIKey(id string) bool {
+	const minInterval = int64(60)
+	now := time.Now().Unix()
+	if previous, ok := s.apiKeyLastUsed.Load(id); ok {
+		if now-previous.(int64) < minInterval {
+			return false
+		}
+	}
+	s.apiKeyLastUsed.Store(id, now)
+	return true
 }
 
 func pageFromRequest(r *http.Request) int {
@@ -758,6 +1093,37 @@ func pageURL(r *http.Request, page int) string {
 		values.Del("page")
 	} else {
 		values.Set("page", strconv.Itoa(page))
+	}
+	query := values.Encode()
+	if query == "" {
+		return r.URL.Path
+	}
+	return r.URL.Path + "?" + query
+}
+
+func buildCursorPagination(r *http.Request, pageSize int, nextCursor string) Pagination {
+	if pageSize < 1 {
+		pageSize = adminPageSize
+	}
+	currentCursor := strings.TrimSpace(r.URL.Query().Get("cursor"))
+	return Pagination{
+		Page:     1,
+		PageSize: pageSize,
+		HasPrev:  currentCursor != "",
+		HasNext:  nextCursor != "",
+		FirstURL: cursorURL(r, ""),
+		PrevURL:  cursorURL(r, ""),
+		NextURL:  cursorURL(r, nextCursor),
+	}
+}
+
+func cursorURL(r *http.Request, cursor string) string {
+	values := r.URL.Query()
+	values.Del("page")
+	if cursor == "" {
+		values.Del("cursor")
+	} else {
+		values.Set("cursor", cursor)
 	}
 	query := values.Encode()
 	if query == "" {
@@ -811,7 +1177,7 @@ func (s *Server) saveSettings(ctx context.Context, settings Settings) error {
 
 func (s *Server) recentImages(ctx context.Context, limit int) ([]ImageRecord, error) {
 	rows, err := s.db.Query(ctx, `select id, public_path, file_path, original_name, size_bytes, mime_type, sha256, coalesce(api_key_id, ''), api_key_name, created_at
-		from images where deleted_at is null order by created_at desc limit $1`, limit)
+		from images where status in ('active', 'delete_failed') order by created_at desc limit $1`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -829,7 +1195,7 @@ func (s *Server) recentImages(ctx context.Context, limit int) ([]ImageRecord, er
 }
 
 func (s *Server) imageFilterWhere(filter ImageFilter) ([]string, []any) {
-	where := []string{"deleted_at is null"}
+	where := []string{"status in ('active', 'delete_failed')"}
 	args := []any{}
 	if q := strings.TrimSpace(filter.Query); q != "" {
 		args = append(args, "%"+q+"%")
@@ -854,13 +1220,16 @@ func (s *Server) imageFilterWhere(filter ImageFilter) ([]string, []any) {
 	return where, args
 }
 
-func (s *Server) searchImages(ctx context.Context, filter ImageFilter, limit int, offset int) ([]ImageRecord, error) {
+func (s *Server) searchImages(ctx context.Context, filter ImageFilter, limit int, cursor string) ([]ImageRecord, error) {
 	where, args := s.imageFilterWhere(filter)
+	if createdAt, id, ok := parseImageCursor(cursor); ok {
+		args = append(args, createdAt, id)
+		where = append(where, fmt.Sprintf("(created_at < $%d or (created_at = $%d and id < $%d))", len(args)-1, len(args)-1, len(args)))
+	}
 	args = append(args, limit)
 	limitArg := len(args)
-	args = append(args, offset)
 	query := fmt.Sprintf(`select id, public_path, file_path, original_name, size_bytes, mime_type, sha256, coalesce(api_key_id, ''), api_key_name, created_at
-		from images where %s order by created_at desc limit $%d offset $%d`, strings.Join(where, " and "), limitArg, len(args))
+		from images where %s order by created_at desc, id desc limit $%d`, strings.Join(where, " and "), limitArg)
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -878,26 +1247,50 @@ func (s *Server) searchImages(ctx context.Context, filter ImageFilter, limit int
 	return items, rows.Err()
 }
 
+func imageCursor(item ImageRecord) string {
+	if item.ID == "" || item.CreatedAt.IsZero() {
+		return ""
+	}
+	return fmt.Sprintf("%d_%s", item.CreatedAt.UnixNano(), item.ID)
+}
+
+func parseImageCursor(value string) (time.Time, string, bool) {
+	parts := strings.SplitN(strings.TrimSpace(value), "_", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return time.Time{}, "", false
+	}
+	nanos, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || nanos <= 0 {
+		return time.Time{}, "", false
+	}
+	return time.Unix(0, nanos).UTC(), parts[1], true
+}
+
 func (s *Server) deleteImageByID(ctx context.Context, id string) error {
-	var path string
-	var size int64
-	err := s.db.QueryRow(ctx, `select file_path, size_bytes from images where id = $1 and deleted_at is null`, id).Scan(&path, &size)
+	item, ok, err := s.reserveImageForDelete(ctx, id)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		}
 		return err
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if !ok {
+		return nil
+	}
+	if err := os.Remove(item.FilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		_ = s.markDeleteFailed(ctx, item.ID, err)
 		return err
 	}
-	_, err = s.markDeleted(ctx, id, size)
+	_, err = s.markDeleted(ctx, item.ID, item.SizeBytes)
 	return err
 }
 
 type CleanupResult struct {
 	Deleted    int64
 	FreedBytes int64
+}
+
+type deleteCandidate struct {
+	ID        string
+	FilePath  string
+	SizeBytes int64
 }
 
 func (s *Server) cleanupLoop() {
@@ -908,7 +1301,7 @@ func (s *Server) cleanupLoop() {
 		settings, err := s.readSettings(context.Background())
 		if err != nil {
 			s.cleanupErrors.Add(1)
-			log.Printf("read cleanup settings: %v", err)
+			logEvent("error", "cleanup_settings_read_failed", map[string]any{"error": err.Error()})
 			continue
 		}
 		if time.Now().Before(next) {
@@ -917,15 +1310,26 @@ func (s *Server) cleanupLoop() {
 		result, err := s.runCleanup(context.Background())
 		if err != nil {
 			s.cleanupErrors.Add(1)
-			log.Printf("cleanup failed: %v", err)
+			logEvent("error", "cleanup_failed", map[string]any{"error": err.Error()})
 		} else if result.Deleted > 0 {
-			log.Printf("cleanup deleted=%d freed=%s", result.Deleted, formatBytes(result.FreedBytes))
+			logEvent("info", "cleanup_completed", map[string]any{"deleted": result.Deleted, "freed_bytes": result.FreedBytes})
 		}
 		next = time.Now().Add(time.Duration(settings.CleanupIntervalMinutes) * time.Minute)
 	}
 }
 
 func (s *Server) runCleanup(ctx context.Context) (CleanupResult, error) {
+	if !s.cleanupActive.CompareAndSwap(false, true) {
+		return CleanupResult{}, nil
+	}
+	defer s.cleanupActive.Store(false)
+
+	if err := s.flushStorageEvents(ctx, 10000); err != nil {
+		return CleanupResult{}, err
+	}
+	if err := s.recoverStaleDeletes(ctx); err != nil {
+		return CleanupResult{}, err
+	}
 	settings, err := s.readSettings(ctx)
 	if err != nil {
 		return CleanupResult{}, err
@@ -941,6 +1345,11 @@ func (s *Server) runCleanup(ctx context.Context) (CleanupResult, error) {
 		total.FreedBytes += result.FreedBytes
 	}
 
+	if total.Deleted > 0 {
+		if err := s.flushStorageEvents(ctx, 10000); err != nil {
+			return total, err
+		}
+	}
 	stats, err := s.readStats(ctx)
 	if err != nil {
 		return total, err
@@ -980,7 +1389,7 @@ func (s *Server) purgeOldUploadLogs(ctx context.Context, settings Settings) erro
 
 func (s *Server) purgeDeletedImageRecords(ctx context.Context, settings Settings) error {
 	cutoff := time.Now().Add(-time.Duration(settings.DeletedRecordRetentionDays) * 24 * time.Hour)
-	return s.deleteInBatches(ctx, `delete from images where id in (select id from images where deleted_at is not null and deleted_at < $1 order by deleted_at asc limit $2)`, cutoff, settings.CleanupBatchSize)
+	return s.deleteInBatches(ctx, `delete from images where id in (select id from images where status = 'deleted' and deleted_at < $1 order by deleted_at asc limit $2)`, cutoff, settings.CleanupBatchSize)
 }
 
 func (s *Server) deleteInBatches(ctx context.Context, query string, cutoff time.Time, batchSize int) error {
@@ -1004,45 +1413,26 @@ func (s *Server) deleteOldestWhere(ctx context.Context, where string, args []any
 	}
 	var total CleanupResult
 	for {
-		query := fmt.Sprintf(`select id, file_path, size_bytes from images where deleted_at is null and %s order by created_at asc limit $%d`, where, len(args)+1)
-		rows, err := s.db.Query(ctx, query, append(args, batchSize)...)
+		items, err := s.reserveOldestForDelete(ctx, where, args, batchSize)
 		if err != nil {
 			return total, err
 		}
-		type candidate struct {
-			id   string
-			path string
-			size int64
-		}
-		var items []candidate
-		for rows.Next() {
-			var item candidate
-			if err := rows.Scan(&item.id, &item.path, &item.size); err != nil {
-				rows.Close()
-				return total, err
-			}
-			items = append(items, item)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return total, err
-		}
-		rows.Close()
 		if len(items) == 0 {
 			return total, nil
 		}
 		for _, item := range items {
-			if err := os.Remove(item.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				log.Printf("remove image file failed path=%s err=%v", item.path, err)
+			if err := os.Remove(item.FilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				_ = s.markDeleteFailed(ctx, item.ID, err)
+				logEvent("error", "image_file_remove_failed", map[string]any{"path": item.FilePath, "error": err.Error()})
 				continue
 			}
-			deleted, err := s.markDeleted(ctx, item.id, item.size)
+			deleted, err := s.markDeleted(ctx, item.ID, item.SizeBytes)
 			if err != nil {
 				return total, err
 			}
 			if deleted {
 				total.Deleted++
-				total.FreedBytes += item.size
+				total.FreedBytes += item.SizeBytes
 				if stopAfterBytes > 0 && total.FreedBytes >= stopAfterBytes {
 					return total, nil
 				}
@@ -1051,24 +1441,111 @@ func (s *Server) deleteOldestWhere(ctx context.Context, where string, args []any
 	}
 }
 
+func (s *Server) reserveImageForDelete(ctx context.Context, id string) (deleteCandidate, bool, error) {
+	var item deleteCandidate
+	err := s.db.QueryRow(ctx, `update images
+		set status = 'deleting', updated_at = now(), delete_error = ''
+		where id = $1 and status in ('active', 'delete_failed')
+		returning id, file_path, size_bytes`, id).Scan(&item.ID, &item.FilePath, &item.SizeBytes)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return deleteCandidate{}, false, nil
+		}
+		return deleteCandidate{}, false, err
+	}
+	return item, true, nil
+}
+
+func (s *Server) reserveOldestForDelete(ctx context.Context, where string, args []any, batchSize int) ([]deleteCandidate, error) {
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	query := fmt.Sprintf(`select id, file_path, size_bytes
+		from images
+		where (status = 'active' or (status = 'delete_failed' and delete_attempts < 5 and updated_at < now() - interval '1 hour')) and %s
+		order by created_at asc
+		limit $%d
+		for update skip locked`, where, len(args)+1)
+	rows, err := tx.Query(ctx, query, append(args, batchSize)...)
+	if err != nil {
+		return nil, err
+	}
+	var items []deleteCandidate
+	for rows.Next() {
+		var item deleteCandidate
+		if err := rows.Scan(&item.ID, &item.FilePath, &item.SizeBytes); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	for _, item := range items {
+		if _, err := tx.Exec(ctx, `update images
+			set status = 'deleting', updated_at = now(), delete_error = ''
+			where id = $1 and (status = 'active' or (status = 'delete_failed' and delete_attempts < 5 and updated_at < now() - interval '1 hour'))`, item.ID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (s *Server) recoverStaleDeletes(ctx context.Context) error {
+	_, err := s.db.Exec(ctx, `update images
+		set status = 'delete_failed',
+			delete_error = 'delete was interrupted before completion',
+			delete_attempts = delete_attempts + 1,
+			updated_at = now()
+		where status = 'deleting' and updated_at < now() - interval '30 minutes'`)
+	return err
+}
+
 func (s *Server) markDeleted(ctx context.Context, id string, size int64) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return false, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	tag, err := tx.Exec(ctx, `update images set deleted_at = now() where id = $1 and deleted_at is null`, id)
+	tag, err := tx.Exec(ctx, `update images
+		set status = 'deleted',
+			deleted_at = coalesce(deleted_at, now()),
+			delete_error = '',
+			updated_at = now()
+		where id = $1 and status = 'deleting'`, id)
 	if err != nil {
 		return false, err
 	}
 	if tag.RowsAffected() == 0 {
 		return false, tx.Commit(ctx)
 	}
-	_, err = tx.Exec(ctx, `update storage_stats set image_count = greatest(image_count - 1, 0::bigint), total_bytes = greatest(total_bytes - $1, 0::bigint), updated_at = now() where id = 1`, size)
-	if err != nil {
+	if err := recordStorageEventTx(ctx, tx, -1, -size); err != nil {
 		return false, err
 	}
 	return true, tx.Commit(ctx)
+}
+
+func (s *Server) markDeleteFailed(ctx context.Context, id string, cause error) error {
+	message := cause.Error()
+	if len(message) > 500 {
+		message = message[:500]
+	}
+	_, err := s.db.Exec(ctx, `update images
+		set status = 'delete_failed',
+			delete_error = $2,
+			delete_attempts = delete_attempts + 1,
+			updated_at = now()
+		where id = $1 and status = 'deleting'`, id, message)
+	return err
 }
 
 func (s *Server) checkUploadAuth(r *http.Request) (UploadPrincipal, bool) {
@@ -1118,6 +1595,38 @@ func (s *Server) writeUploadLog(ctx context.Context, item UploadLog) error {
 	return err
 }
 
+func (s *Server) enqueueUploadLog(item UploadLog) {
+	if item.Status == "success" && !s.shouldLogSuccessfulUpload() {
+		return
+	}
+	select {
+	case s.uploadLogQueue <- item:
+	default:
+		s.droppedUploadLogs.Add(1)
+		logEvent("warn", "upload_log_dropped", map[string]any{"status": item.Status, "image_id": item.ImageID, "api_key_id": item.APIKeyID})
+	}
+}
+
+func (s *Server) shouldLogSuccessfulUpload() bool {
+	percent := s.cfg.SuccessUploadLogSamplePercent
+	if percent <= 0 {
+		return false
+	}
+	if percent >= 100 {
+		return true
+	}
+	return rand.Intn(100) < percent
+}
+
+func (s *Server) uploadLogLoop() {
+	for item := range s.uploadLogQueue {
+		if err := s.writeUploadLog(context.Background(), item); err != nil {
+			s.droppedUploadLogs.Add(1)
+			logEvent("error", "upload_log_write_failed", map[string]any{"error": err.Error(), "status": item.Status, "image_id": item.ImageID})
+		}
+	}
+}
+
 func (s *Server) listAPIKeys(ctx context.Context) ([]APIKey, error) {
 	rows, err := s.db.Query(ctx, `select id, name, key_hash, prefix, enabled, created_at, coalesce(last_used_at, '0001-01-01 00:00:00+00'::timestamptz) from api_keys order by created_at desc`)
 	if err != nil {
@@ -1135,9 +1644,16 @@ func (s *Server) listAPIKeys(ctx context.Context) ([]APIKey, error) {
 	return items, rows.Err()
 }
 
-func (s *Server) listUploadLogs(ctx context.Context, limit int, offset int) ([]UploadLog, error) {
-	rows, err := s.db.Query(ctx, `select id, coalesce(image_id, ''), coalesce(api_key_id, ''), api_key_name, original_name, size_bytes, mime_type, ip, user_agent, status, message, created_at
-		from upload_logs order by created_at desc limit $1 offset $2`, limit, offset)
+func (s *Server) listUploadLogs(ctx context.Context, limit int, beforeID int64) ([]UploadLog, error) {
+	query := `select id, coalesce(image_id, ''), coalesce(api_key_id, ''), api_key_name, original_name, size_bytes, mime_type, ip, user_agent, status, message, created_at
+		from upload_logs order by id desc limit $1`
+	args := []any{limit}
+	if beforeID > 0 {
+		query = `select id, coalesce(image_id, ''), coalesce(api_key_id, ''), api_key_name, original_name, size_bytes, mime_type, ip, user_agent, status, message, created_at
+			from upload_logs where id < $2 order by id desc limit $1`
+		args = append(args, beforeID)
+	}
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1218,8 +1734,16 @@ func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 			http.Redirect(w, r, "/fyanxv/login", http.StatusFound)
 			return
 		}
+		if requiresCSRF(r.Method) && !s.validCSRF(r) {
+			http.Error(w, "invalid csrf token", http.StatusForbidden)
+			return
+		}
 		next(w, r)
 	}
+}
+
+func requiresCSRF(method string) bool {
+	return method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions
 }
 
 func (s *Server) signSession(exp int64) string {
@@ -1244,6 +1768,31 @@ func (s *Server) validSession(r *http.Request) bool {
 	}
 	expected := s.signSession(exp)
 	return hmac.Equal([]byte(expected), []byte(cookie.Value))
+}
+
+func (s *Server) csrfToken(r *http.Request) string {
+	cookie, err := r.Cookie("image_bed_session")
+	if err != nil {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(s.cfg.SessionSecret))
+	_, _ = mac.Write([]byte("csrf:" + cookie.Value))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (s *Server) validCSRF(r *http.Request) bool {
+	expected := s.csrfToken(r)
+	if expected == "" {
+		return false
+	}
+	token := r.Header.Get("X-CSRF-Token")
+	if token == "" {
+		if err := r.ParseForm(); err != nil {
+			return false
+		}
+		token = r.FormValue("csrf_token")
+	}
+	return hmac.Equal([]byte(expected), []byte(token))
 }
 
 func imageExt(mimeType string) (string, bool) {
@@ -1273,15 +1822,16 @@ func render(w http.ResponseWriter, raw string, data any) {
 	}).Parse(raw))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := tpl.Execute(w, data); err != nil {
-		log.Printf("render page: %v", err)
+		logEvent("error", "page_render_failed", map[string]any{"error": err.Error()})
 	}
 }
 
-func renderAdmin(w http.ResponseWriter, page string, data map[string]any) {
+func (s *Server) renderAdmin(w http.ResponseWriter, r *http.Request, page string, data map[string]any) {
 	if data == nil {
 		data = map[string]any{}
 	}
 	data["Page"] = page
+	data["CSRF"] = s.csrfToken(r)
 	tpl := template.Must(template.New("admin").Funcs(template.FuncMap{
 		"bytes": formatBytes,
 		"date":  formatTime,
@@ -1289,7 +1839,7 @@ func renderAdmin(w http.ResponseWriter, page string, data map[string]any) {
 	}).Parse(adminTemplateV2))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := tpl.Execute(w, data); err != nil {
-		log.Printf("render admin page: %v", err)
+		logEvent("error", "admin_render_failed", map[string]any{"error": err.Error()})
 	}
 }
 
@@ -1297,8 +1847,34 @@ func logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
+		logEvent("info", "http_request", map[string]any{"method": r.Method, "path": r.URL.Path, "duration_ms": time.Since(start).Milliseconds()})
 	})
+}
+
+func logEvent(level string, event string, fields map[string]any) {
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	fields["level"] = level
+	fields["event"] = event
+	fields["ts"] = time.Now().UTC().Format(time.RFC3339Nano)
+	data, err := json.Marshal(fields)
+	if err != nil {
+		log.Printf(`{"level":"error","event":"log_encode_failed","error":%q}`, err.Error())
+		return
+	}
+	log.Print(string(data))
+}
+
+func fatalEvent(event string, err error, fields map[string]any) {
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	if err != nil {
+		fields["error"] = err.Error()
+	}
+	logEvent("fatal", event, fields)
+	os.Exit(1)
 }
 
 func env(key, fallback string) string {
@@ -1311,6 +1887,28 @@ func env(key, fallback string) string {
 
 func envInt(key string, fallback int) int {
 	return positiveInt(os.Getenv(key), fallback)
+}
+
+func envIntAllowZero(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
+}
+
+func clampInt(value int, minValue int, maxValue int) int {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
 }
 
 func positiveInt(value string, fallback int) int {
@@ -1355,7 +1953,7 @@ func splitCSV(value string) []string {
 
 func randomHex(bytes int) string {
 	buf := make([]byte, bytes)
-	if _, err := rand.Read(buf); err != nil {
+	if _, err := cryptorand.Read(buf); err != nil {
 		return strconv.FormatInt(time.Now().UnixNano(), 16)
 	}
 	return hex.EncodeToString(buf)
@@ -1404,12 +2002,20 @@ func shortText(value string, max int) string {
 	return string(runes[:max]) + "..."
 }
 
+func formatRateLimit(value int) string {
+	if value <= 0 {
+		return "不限"
+	}
+	return fmt.Sprintf("%d/分钟", value)
+}
+
 const loginTemplate = `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fyanxv 登录</title>
+<title>知梦图床 登录</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
 body{margin:0;font-family:Inter,Arial,sans-serif;background:#f5f7fb;color:#172033;display:grid;place-items:center;min-height:100vh}
 .box{width:min(360px,calc(100vw - 32px));background:#fff;border:1px solid #dce3ee;border-radius:8px;padding:24px;box-shadow:0 18px 50px #20305018}
@@ -1422,7 +2028,7 @@ button{width:100%;border:0;border-radius:6px;background:#1769e0;color:#fff;paddi
 </head>
 <body>
 <form class="box" method="post" action="/fyanxv/login">
-<h1>Fyanxv</h1>
+<h1>知梦图床</h1>
 {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
 <label>用户名</label><input name="username" autocomplete="username" required>
 <label>密码</label><input type="password" name="password" autocomplete="current-password" required>
@@ -1436,7 +2042,8 @@ const loginTemplateV2 = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fyanxv 登录</title>
+<title>知梦图床 登录</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
 body{margin:0;font-family:Inter,Arial,"Microsoft YaHei",sans-serif;background:#f5f7fb;color:#172033;display:grid;place-items:center;min-height:100vh}
 .box{width:min(360px,calc(100vw - 32px));background:#fff;border:1px solid #dce3ee;border-radius:8px;padding:24px;box-shadow:0 18px 50px #20305018}
@@ -1449,7 +2056,7 @@ button{width:100%;border:0;border-radius:6px;background:#1769e0;color:#fff;paddi
 </head>
 <body>
 <form class="box" method="post" action="/fyanxv/login">
-<h1>Fyanxv</h1>
+<h1>知梦图床</h1>
 {{if .Error}}<div class="err">{{.Error}}</div>{{end}}
 <label>用户名</label><input name="username" autocomplete="username" required>
 <label>密码</label><input type="password" name="password" autocomplete="current-password" required>
@@ -1463,7 +2070,8 @@ const adminTemplateV2 = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fyanxv 后台</title>
+<title>知梦图床 后台</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
 *{box-sizing:border-box}
 body{margin:0;font-family:Inter,Arial,"Microsoft YaHei",sans-serif;background:#f4f7fb;color:#172033}
@@ -1477,7 +2085,7 @@ body{margin:0;font-family:Inter,Arial,"Microsoft YaHei",sans-serif;background:#f
 .top{height:56px;background:#fff;border-bottom:1px solid #dce3ee;display:flex;align-items:center;justify-content:space-between;padding:0 24px}
 .top h1{font-size:18px;margin:0}
 .content{padding:22px;max-width:1280px}
-.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}
 .card{background:#fff;border:1px solid #dce3ee;border-radius:8px;padding:16px;margin-bottom:16px}
 .k{font-size:12px;color:#65758b}.v{font-size:24px;font-weight:800;margin-top:8px}
 h2{font-size:16px;margin:0 0 14px}
@@ -1511,7 +2119,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <body>
 <div class="layout">
 <aside class="side">
-<div class="brand"><img src="https://www.tfbkw.com/wp-content/themes/ZibTF/img/zm.svg" alt="Fyanxv"><span>Fyanxv</span></div>
+<div class="brand"><img src="/assets/zm.svg" alt="知梦图床"><span>知梦图床</span></div>
 <nav class="nav">
 <a class="{{if eq .Page "overview"}}active{{end}}" href="/fyanxv">概览</a>
 <a class="{{if eq .Page "images"}}active{{end}}" href="/fyanxv/images">图片管理</a>
@@ -1524,7 +2132,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <main class="main">
 <header class="top">
 <h1>{{if eq .Page "overview"}}概览{{else if eq .Page "images"}}图片管理{{else if eq .Page "api_keys"}}API 密钥{{else if eq .Page "logs"}}上传日志{{else if eq .Page "docs"}}接入文档{{else}}系统设置{{end}}</h1>
-<form class="inline" method="post" action="/fyanxv/logout"><button class="secondary">退出登录</button></form>
+<form class="inline" method="post" action="/fyanxv/logout"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><button class="secondary">退出登录</button></form>
 </header>
 <section class="content">
 
@@ -1535,6 +2143,8 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <div class="card"><div class="k">已用容量</div><div class="v">{{.TotalHuman}}</div></div>
 <div class="card"><div class="k">API 密钥数</div><div class="v">{{.APIKeyCount}}</div></div>
 <div class="card"><div class="k">单图上传上限</div><div class="v">{{.MaxUpload}}</div></div>
+<div class="card"><div class="k">活跃上传</div><div class="v">{{.ActiveUploads}} / {{.MaxConcurrentUploads}}</div></div>
+<div class="card"><div class="k">速率限制</div><div class="v" style="font-size:15px;line-height:1.7">Key {{.RateLimitKey}}<br>IP {{.RateLimitIP}}</div></div>
 </section>
 <section class="card">
 <h2>最近上传图片</h2>
@@ -1563,18 +2173,19 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <td><a href="{{.URL}}" target="_blank"><img class="thumb" src="{{.PublicPath}}" alt=""></a></td>
 <td><a href="{{.URL}}" target="_blank">{{.OriginalName}}</a><br><span class="muted">{{.PublicPath}}</span></td>
 <td>{{bytes .SizeBytes}}</td><td>{{.MimeType}}</td><td>{{.APIKeyName}}</td><td>{{date .CreatedAt}}</td>
-<td><form method="post" action="/fyanxv/images/delete" onsubmit="return confirm('确定删除这张图片吗？')"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">删除</button></form></td>
+<td><form method="post" action="/fyanxv/images/delete" onsubmit="return confirm('确定删除这张图片吗？')"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">删除</button></form></td>
 </tr>{{else}}<tr><td colspan="7">没有找到图片。</td></tr>{{end}}
 </tbody></table>
 </section>
 {{end}}
 
-{{if and (eq .Page "images") .Pagination}}<div class="pager"><span>第 {{.Pagination.Page}} 页，每页 {{.Pagination.PageSize}} 条</span><a class="btn secondary {{if not .Pagination.HasPrev}}disabled{{end}}" href="{{.Pagination.FirstURL}}">第一页</a><a class="btn secondary {{if not .Pagination.HasPrev}}disabled{{end}}" href="{{.Pagination.PrevURL}}">上一页</a><a class="btn secondary {{if not .Pagination.HasNext}}disabled{{end}}" href="{{.Pagination.NextURL}}">下一页</a></div>{{end}}
+{{if and (eq .Page "images") .Pagination}}<div class="pager"><span>每页 {{.Pagination.PageSize}} 条</span><a class="btn secondary {{if not .Pagination.HasPrev}}disabled{{end}}" href="{{.Pagination.FirstURL}}">第一页</a><a class="btn secondary {{if not .Pagination.HasNext}}disabled{{end}}" href="{{.Pagination.NextURL}}">下一页</a></div>{{end}}
 {{if eq .Page "api_keys"}}
 {{if .CreatedKey}}<div class="alert"><strong>新密钥已生成，只显示这一次：</strong><br><code>{{.CreatedKey}}</code></div>{{end}}
 <section class="card">
 <h2>生成 API 密钥</h2>
 <form method="post" action="/fyanxv/api-keys" class="row">
+<input type="hidden" name="csrf_token" value="{{.CSRF}}">
 <div style="grid-column:span 4"><label>密钥名称</label><input name="name" placeholder="例如：画布上传、测试环境"></div>
 <div><button type="submit">生成密钥</button></div>
 </form>
@@ -1584,7 +2195,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <table><thead><tr><th>名称</th><th>前缀</th><th>状态</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead><tbody>
 {{range .Keys}}<tr>
 <td>{{.Name}}</td><td><code>{{.Prefix}}</code></td><td>{{if .Enabled}}<span class="tag ok">启用</span>{{else}}<span class="tag bad">停用</span>{{end}}</td><td>{{date .CreatedAt}}</td><td>{{date .LastUsedAt}}</td>
-<td><form class="inline" method="post" action="/fyanxv/api-keys/toggle"><input type="hidden" name="id" value="{{.ID}}"><button class="secondary" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form> <form class="inline" method="post" action="/fyanxv/api-keys/delete" onsubmit="return confirm('确定删除这个密钥吗？')"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">删除</button></form></td>
+<td><form class="inline" method="post" action="/fyanxv/api-keys/toggle"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button class="secondary" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form> <form class="inline" method="post" action="/fyanxv/api-keys/delete" onsubmit="return confirm('确定删除这个密钥吗？')"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">删除</button></form></td>
 </tr>{{else}}<tr><td colspan="6">还没有密钥。</td></tr>{{end}}
 </tbody></table>
 </section>
@@ -1600,13 +2211,14 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 </section>
 {{end}}
 
-{{if and (eq .Page "logs") .Pagination}}<div class="pager"><span>第 {{.Pagination.Page}} 页，每页 {{.Pagination.PageSize}} 条</span><a class="btn secondary {{if not .Pagination.HasPrev}}disabled{{end}}" href="{{.Pagination.FirstURL}}">第一页</a><a class="btn secondary {{if not .Pagination.HasPrev}}disabled{{end}}" href="{{.Pagination.PrevURL}}">上一页</a><a class="btn secondary {{if not .Pagination.HasNext}}disabled{{end}}" href="{{.Pagination.NextURL}}">下一页</a></div>{{end}}
+{{if and (eq .Page "logs") .Pagination}}<div class="pager"><span>每页 {{.Pagination.PageSize}} 条</span><a class="btn secondary {{if not .Pagination.HasPrev}}disabled{{end}}" href="{{.Pagination.FirstURL}}">第一页</a><a class="btn secondary {{if not .Pagination.HasNext}}disabled{{end}}" href="{{.Pagination.NextURL}}">下一页</a></div>{{end}}
 {{if eq .Page "docs"}}
 <section class="card">
 <h2>上传接口</h2>
 <p>接口地址：<code>{{.PublicBaseURL}}/api/upload</code></p>
 <p>请求方式：<code>POST multipart/form-data</code>，文件字段名使用 <code>file</code> 或 <code>image</code>。</p>
 <p>鉴权方式：请求头 <code>Authorization: Bearer 你的_API_KEY</code>，也支持 <code>X-API-Key: 你的_API_KEY</code>。</p>
+<p>当前上传限速：API Key <code>{{.RateLimitKey}}</code>，IP <code>{{.RateLimitIP}}</code>。</p>
 <pre>curl -X POST {{.PublicBaseURL}}/api/upload \
   -H "Authorization: Bearer 你的_API_KEY" \
   -F "file=@./test.png"</pre>
@@ -1629,6 +2241,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <section class="card">
 <h2>清理设置</h2>
 <form method="post" action="/fyanxv/settings" class="row">
+<input type="hidden" name="csrf_token" value="{{.CSRF}}">
 <div><label>保留天数</label><input type="number" min="1" name="retention_days" value="{{.Settings.RetentionDays}}"></div>
 <div><label>容量上限 GB</label><input type="number" min="1" name="capacity_gb" value="{{.Settings.CapacityGB}}"></div>
 <div><label>超限后清理 GB</label><input type="number" min="1" name="trim_gb" value="{{.Settings.TrimGB}}"></div>
@@ -1638,8 +2251,8 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <div><label>删除记录保留天数</label><input type="number" min="1" name="deleted_record_retention_days" value="{{.Settings.DeletedRecordRetentionDays}}"></div>
 <div><button type="submit">保存设置</button></div>
 </form>
-<form method="post" action="/fyanxv/cleanup" style="margin-top:12px"><button class="secondary" type="submit">立即执行清理</button></form>
-<p class="muted">当前公网地址前缀：<code>{{.PublicBaseURL}}</code>。清理次数：{{.CleanupRuns}}，清理错误：{{.CleanupErrors}}。</p>
+<form method="post" action="/fyanxv/cleanup" style="margin-top:12px"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><button class="secondary" type="submit">立即执行清理</button></form>
+<p class="muted">当前公网地址前缀：<code>{{.PublicBaseURL}}</code>。上传限速：Key {{.RateLimitKey}}，IP {{.RateLimitIP}}。清理次数：{{.CleanupRuns}}，清理错误：{{.CleanupErrors}}。</p>
 </section>
 {{end}}
 
@@ -1676,7 +2289,8 @@ const adminTemplate = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Fyanxv 后台</title>
+<title>知梦图床 后台</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
 body{margin:0;font-family:Inter,Arial,sans-serif;background:#f5f7fb;color:#172033}
 header{height:56px;background:#111827;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 24px}
@@ -1702,8 +2316,8 @@ code{background:#eef3fb;padding:2px 5px;border-radius:4px}
 </head>
 <body>
 <header>
-<strong>Fyanxv</strong>
-<form class="inline" method="post" action="/fyanxv/logout"><button class="secondary">退出登录</button></form>
+<strong>知梦图床</strong>
+<form class="inline" method="post" action="/fyanxv/logout"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><button class="secondary">退出登录</button></form>
 </header>
 <main>
 <section class="grid">
@@ -1716,6 +2330,7 @@ code{background:#eef3fb;padding:2px 5px;border-radius:4px}
 <section class="card" style="margin-top:16px">
 <h2>清理设置</h2>
 <form method="post" action="/fyanxv/settings" class="settings">
+<input type="hidden" name="csrf_token" value="{{.CSRF}}">
 <div><label>保留天数</label><input type="number" min="1" name="retention_days" value="{{.Settings.RetentionDays}}"></div>
 <div><label>容量上限 GB</label><input type="number" min="1" name="capacity_gb" value="{{.Settings.CapacityGB}}"></div>
 <div><label>超限后清理 GB</label><input type="number" min="1" name="trim_gb" value="{{.Settings.TrimGB}}"></div>
@@ -1723,7 +2338,7 @@ code{background:#eef3fb;padding:2px 5px;border-radius:4px}
 <div><label>每批清理数量</label><input type="number" min="100" name="cleanup_batch_size" value="{{.Settings.CleanupBatchSize}}"></div>
 <div><button type="submit">保存设置</button></div>
 </form>
-<form method="post" action="/fyanxv/cleanup" style="margin-top:12px"><button class="secondary" type="submit">立即执行清理</button></form>
+<form method="post" action="/fyanxv/cleanup" style="margin-top:12px"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><button class="secondary" type="submit">立即执行清理</button></form>
 <p class="k">清理次数：{{.CleanupRuns}}，清理错误：{{.CleanupErrors}}。公网地址前缀：<code>{{.PublicBaseURL}}</code></p>
 </section>
 
