@@ -15,7 +15,7 @@ It is designed for this flow:
 - `POST /api/upload` multipart upload with API key auth.
 - Streaming upload, no base64 payloads.
 - API keys can default uploads to timed cleanup or permanent retention.
-- Permanent uploads return a one-time `deleteId`; callers can delete the image later with the same API key.
+- Permanent uploads return a one-time `deleteId`; callers can queue image deletion later with the same API key.
 - Local disk storage with date-based paths.
 - PostgreSQL metadata and fast aggregate stats.
 - Admin pages with overview, image search, single image deletion, API key
@@ -63,12 +63,16 @@ Response:
 }
 ```
 
-Delete a permanent image by the returned id:
+Queue deletion for a permanent image by the returned id:
 
 ```bash
 curl -X DELETE http://localhost:8080/api/permanent-images/pimg_... \
   -H "Authorization: Bearer change-this-upload-key"
 ```
+
+The delete API is asynchronous and idempotent. It validates the same API key,
+stores the delete request in PostgreSQL, and background workers remove the file
+from disk with bounded concurrency and retries.
 
 ## Environment
 
@@ -87,6 +91,11 @@ curl -X DELETE http://localhost:8080/api/permanent-images/pimg_... \
 | `UPLOAD_RATE_LIMIT_PER_IP_PER_MINUTE` | `0` | Per-IP upload rate limit. `0` means unlimited. |
 | `UPLOAD_LOG_QUEUE_SIZE` | `4096` | Async upload log queue size. Full queues drop log rows, not uploads. |
 | `SUCCESS_UPLOAD_LOG_SAMPLE_PERCENT` | `100` | Successful upload log sampling percent. `0` logs failures only. |
+| `PERMANENT_DELETE_WORKERS` | `2` | Background workers for permanent-image delete jobs. `0` disables workers. |
+| `PERMANENT_DELETE_BATCH_SIZE` | `100` | Maximum queued permanent deletes reserved per worker tick. |
+| `PERMANENT_DELETE_POLL_SECONDS` | `2` | Worker polling interval for queued permanent deletes. |
+| `PERMANENT_DELETE_RETRY_SECONDS` | `300` | Delay before retrying a failed permanent delete. |
+| `PERMANENT_DELETE_MAX_ATTEMPTS` | `8` | Maximum automatic attempts for failed permanent deletes. |
 | `ADMIN_USER` | `Fyanxv` | Admin login username. |
 | `ADMIN_PASSWORD` | `Fyb2530+` | Change in production. |
 | `SESSION_SECRET` | random per boot | Set a stable random string in production. |

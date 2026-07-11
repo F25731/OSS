@@ -48,6 +48,11 @@ type Config struct {
 	UploadRateLimitPerIPPerMinute  int
 	UploadLogQueueSize             int
 	SuccessUploadLogSamplePercent  int
+	PermanentDeleteWorkers         int
+	PermanentDeleteBatchSize       int
+	PermanentDeletePollInterval    time.Duration
+	PermanentDeleteRetryDelay      time.Duration
+	PermanentDeleteMaxAttempts     int
 	AdminUser                      string
 	AdminPassword                  string
 	SessionSecret                  string
@@ -56,26 +61,28 @@ type Config struct {
 }
 
 type Server struct {
-	cfg                Config
-	db                 *pgxpool.Pool
-	cleanupRuns        atomic.Int64
-	cleanupErrors      atomic.Int64
-	cleanupActive      atomic.Bool
-	statsFlushActive   atomic.Bool
-	apiKeyLastUsed     sync.Map
-	uploadSlots        chan struct{}
-	uploadQueue        chan struct{}
-	activeUploads      atomic.Int64
-	queuedUploads      atomic.Int64
-	totalUploads       atomic.Int64
-	failedUploads      atomic.Int64
-	rateLimitedUploads atomic.Int64
-	rateMu             sync.Mutex
-	rateWindows        map[string]rateWindow
-	uploadLogQueue     chan UploadLog
-	droppedUploadLogs  atomic.Int64
-	loginMu            sync.Mutex
-	loginAttempts      map[string]loginAttempt
+	cfg                   Config
+	db                    *pgxpool.Pool
+	cleanupRuns           atomic.Int64
+	cleanupErrors         atomic.Int64
+	cleanupActive         atomic.Bool
+	statsFlushActive      atomic.Bool
+	apiKeyLastUsed        sync.Map
+	uploadSlots           chan struct{}
+	uploadQueue           chan struct{}
+	activeUploads         atomic.Int64
+	queuedUploads         atomic.Int64
+	totalUploads          atomic.Int64
+	failedUploads         atomic.Int64
+	rateLimitedUploads    atomic.Int64
+	rateMu                sync.Mutex
+	rateWindows           map[string]rateWindow
+	uploadLogQueue        chan UploadLog
+	droppedUploadLogs     atomic.Int64
+	permanentDeleted      atomic.Int64
+	permanentDeleteErrors atomic.Int64
+	loginMu               sync.Mutex
+	loginAttempts         map[string]loginAttempt
 }
 
 type rateWindow struct {
@@ -170,6 +177,17 @@ type Stats struct {
 	TotalBytes int64
 }
 
+type PermanentDeleteStats struct {
+	Queued         int64 `json:"queued"`
+	Deleting       int64 `json:"deleting"`
+	Failed         int64 `json:"failed"`
+	CompletedTotal int64 `json:"completedTotal"`
+	ErrorTotal     int64 `json:"errorTotal"`
+	Workers        int   `json:"workers"`
+	BatchSize      int   `json:"batchSize"`
+	MaxAttempts    int   `json:"maxAttempts"`
+}
+
 type Settings struct {
 	RetentionDays              int
 	CapacityGB                 int
@@ -221,6 +239,9 @@ func main() {
 	go srv.cleanupLoop()
 	go srv.statsLoop()
 	go srv.uploadLogLoop()
+	for workerID := 1; workerID <= cfg.PermanentDeleteWorkers; workerID++ {
+		go srv.permanentDeleteLoop(workerID)
+	}
 
 	logEvent("info", "server_start", map[string]any{"listen": cfg.ListenAddr, "storage": cfg.StorageDir})
 	httpServer := &http.Server{
@@ -253,6 +274,11 @@ func loadConfig() Config {
 		UploadRateLimitPerIPPerMinute:  envIntAllowZero("UPLOAD_RATE_LIMIT_PER_IP_PER_MINUTE", 0),
 		UploadLogQueueSize:             envInt("UPLOAD_LOG_QUEUE_SIZE", 4096),
 		SuccessUploadLogSamplePercent:  clampInt(envIntAllowZero("SUCCESS_UPLOAD_LOG_SAMPLE_PERCENT", 100), 0, 100),
+		PermanentDeleteWorkers:         clampInt(envIntAllowZero("PERMANENT_DELETE_WORKERS", 2), 0, 16),
+		PermanentDeleteBatchSize:       envInt("PERMANENT_DELETE_BATCH_SIZE", 100),
+		PermanentDeletePollInterval:    time.Duration(envInt("PERMANENT_DELETE_POLL_SECONDS", 2)) * time.Second,
+		PermanentDeleteRetryDelay:      time.Duration(envInt("PERMANENT_DELETE_RETRY_SECONDS", 300)) * time.Second,
+		PermanentDeleteMaxAttempts:     envInt("PERMANENT_DELETE_MAX_ATTEMPTS", 8),
 		AdminUser:                      env("ADMIN_USER", "Fyanxv"),
 		AdminPassword:                  env("ADMIN_PASSWORD", "Fyb2530+"),
 		SessionSecret:                  env("SESSION_SECRET", randomHex(32)),
@@ -510,16 +536,20 @@ func (s *Server) handlePermanentImageAPIDelete(w http.ResponseWriter, r *http.Re
 		writeJSON(w, http.StatusBadRequest, 1, nil, "deleteId is required")
 		return
 	}
-	deleted, err := s.deletePermanentImageByDeleteID(r.Context(), principal, deleteID)
+	result, err := s.queuePermanentImageDeleteByDeleteID(r.Context(), principal, deleteID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, 1, nil, err.Error())
 		return
 	}
-	if !deleted {
+	if !result.Found {
 		writeJSON(w, http.StatusNotFound, 1, nil, "permanent image not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, 0, map[string]any{"deleted": true}, "ok")
+	writeJSON(w, http.StatusOK, 0, map[string]any{
+		"queued":  result.Queued,
+		"deleted": result.Deleted,
+		"status":  result.Status,
+	}, "accepted")
 }
 
 func (s *Server) allowUploadRate(principal UploadPrincipal, ip string) (string, bool) {
@@ -738,6 +768,11 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, 1, nil, err.Error())
 		return
 	}
+	deleteStats, err := s.readPermanentDeleteStats(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, 1, nil, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, 0, map[string]any{
 		"images":        stats.ImageCount,
 		"bytes":         stats.TotalBytes,
@@ -756,6 +791,7 @@ func (s *Server) handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 			"rateLimitKey":        formatRateLimit(s.cfg.UploadRateLimitPerKeyPerMinute),
 			"rateLimitIP":         formatRateLimit(s.cfg.UploadRateLimitPerIPPerMinute),
 		},
+		"permanentDeletes": deleteStats,
 	}, "ok")
 }
 
@@ -765,6 +801,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	dbStats := s.db.Stat()
 	var pendingEvents int64
 	_ = s.db.QueryRow(r.Context(), `select count(*) from storage_events`).Scan(&pendingEvents)
+	deleteStats, err := s.readPermanentDeleteStats(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, 1, nil, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, 0, map[string]any{
 		"uploads": map[string]any{
 			"active":                   s.activeUploads.Load(),
@@ -787,6 +828,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			"errors": s.cleanupErrors.Load(),
 			"active": s.cleanupActive.Load(),
 		},
+		"permanentDeletes": deleteStats,
 		"storageEvents": map[string]any{
 			"pending": pendingEvents,
 		},
@@ -899,6 +941,11 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	deleteStats, err := s.readPermanentDeleteStats(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	s.renderAdmin(w, r, "overview", map[string]any{
 		"Stats":                stats,
 		"Recent":               recent,
@@ -915,6 +962,7 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		"CleanupRuns":          s.cleanupRuns.Load(),
 		"CleanupErrors":        s.cleanupErrors.Load(),
 		"APIKeyCount":          len(keys),
+		"PermanentDeleteStats": deleteStats,
 	})
 }
 
@@ -981,7 +1029,7 @@ func (s *Server) handlePermanentImageDelete(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "缺少图片 ID", http.StatusBadRequest)
 		return
 	}
-	if err := s.deleteImageByID(r.Context(), id); err != nil {
+	if _, err := s.queuePermanentImageDeleteByID(r.Context(), id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1140,6 +1188,40 @@ func (s *Server) readStats(ctx context.Context) (Stats, error) {
 	var stats Stats
 	err := s.db.QueryRow(ctx, `select image_count, total_bytes from storage_stats where id = 1`).Scan(&stats.ImageCount, &stats.TotalBytes)
 	return stats, err
+}
+
+func (s *Server) readPermanentDeleteStats(ctx context.Context) (PermanentDeleteStats, error) {
+	stats := PermanentDeleteStats{
+		CompletedTotal: s.permanentDeleted.Load(),
+		ErrorTotal:     s.permanentDeleteErrors.Load(),
+		Workers:        s.cfg.PermanentDeleteWorkers,
+		BatchSize:      s.cfg.PermanentDeleteBatchSize,
+		MaxAttempts:    s.cfg.PermanentDeleteMaxAttempts,
+	}
+	rows, err := s.db.Query(ctx, `select status, count(*) from images
+		where retention_policy = 'permanent'
+			and status in ('delete_queued', 'deleting', 'delete_failed')
+		group by status`)
+	if err != nil {
+		return stats, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var status string
+		var count int64
+		if err := rows.Scan(&status, &count); err != nil {
+			return stats, err
+		}
+		switch status {
+		case "delete_queued":
+			stats.Queued = count
+		case "deleting":
+			stats.Deleting = count
+		case "delete_failed":
+			stats.Failed = count
+		}
+	}
+	return stats, rows.Err()
 }
 
 func (s *Server) statsLoop() {
@@ -1448,20 +1530,54 @@ func (s *Server) deleteImageByID(ctx context.Context, id string) error {
 	return err
 }
 
-func (s *Server) deletePermanentImageByDeleteID(ctx context.Context, principal UploadPrincipal, deleteID string) (bool, error) {
-	item, ok, err := s.reservePermanentImageForDelete(ctx, principal.ID, hashAPIKey(deleteID))
+func (s *Server) queuePermanentImageDeleteByDeleteID(ctx context.Context, principal UploadPrincipal, deleteID string) (deleteQueueResult, error) {
+	deleteHash := hashAPIKey(deleteID)
+	var imageID string
+	err := s.db.QueryRow(ctx, `update images
+		set status = 'delete_queued', updated_at = now(), delete_error = ''
+		where delete_token_hash = $1
+			and api_key_id = $2
+			and retention_policy = 'permanent'
+			and status in ('active', 'delete_failed')
+		returning id`, deleteHash, principal.ID).Scan(&imageID)
+	if err == nil {
+		return deleteQueueResult{Found: true, Queued: true, Status: "delete_queued"}, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return deleteQueueResult{}, err
+	}
+
+	var status string
+	err = s.db.QueryRow(ctx, `select status from images
+		where delete_token_hash = $1
+			and api_key_id = $2
+			and retention_policy = 'permanent'`, deleteHash, principal.ID).Scan(&status)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return deleteQueueResult{}, nil
+		}
+		return deleteQueueResult{}, err
+	}
+	result := deleteQueueResult{Found: true, Status: status}
+	switch status {
+	case "delete_queued", "deleting":
+		result.Queued = true
+	case "deleted":
+		result.Deleted = true
+	}
+	return result, nil
+}
+
+func (s *Server) queuePermanentImageDeleteByID(ctx context.Context, id string) (bool, error) {
+	tag, err := s.db.Exec(ctx, `update images
+		set status = 'delete_queued', updated_at = now(), delete_error = ''
+		where id = $1
+			and retention_policy = 'permanent'
+			and status in ('active', 'delete_failed')`, id)
 	if err != nil {
 		return false, err
 	}
-	if !ok {
-		return false, nil
-	}
-	if err := os.Remove(item.FilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		_ = s.markDeleteFailed(ctx, item.ID, err)
-		return false, err
-	}
-	deleted, err := s.markDeleted(ctx, item.ID, item.SizeBytes)
-	return deleted, err
+	return tag.RowsAffected() > 0, nil
 }
 
 type CleanupResult struct {
@@ -1469,10 +1585,64 @@ type CleanupResult struct {
 	FreedBytes int64
 }
 
+type deleteQueueResult struct {
+	Found   bool
+	Queued  bool
+	Deleted bool
+	Status  string
+}
+
 type deleteCandidate struct {
 	ID        string
 	FilePath  string
 	SizeBytes int64
+}
+
+func (s *Server) permanentDeleteLoop(workerID int) {
+	if s.cfg.PermanentDeleteWorkers <= 0 {
+		return
+	}
+	ticker := time.NewTicker(s.cfg.PermanentDeletePollInterval)
+	defer ticker.Stop()
+	for {
+		if deleted, failed, err := s.processQueuedPermanentDeletes(context.Background()); err != nil {
+			s.permanentDeleteErrors.Add(1)
+			logEvent("error", "permanent_delete_worker_failed", map[string]any{"worker": workerID, "error": err.Error()})
+		} else if deleted > 0 || failed > 0 {
+			logEvent("info", "permanent_delete_worker_batch", map[string]any{"worker": workerID, "deleted": deleted, "failed": failed})
+		}
+		<-ticker.C
+	}
+}
+
+func (s *Server) processQueuedPermanentDeletes(ctx context.Context) (int64, int64, error) {
+	if err := s.recoverStaleDeletes(ctx); err != nil {
+		return 0, 0, err
+	}
+	items, err := s.reserveQueuedPermanentDeletes(ctx, s.cfg.PermanentDeleteBatchSize)
+	if err != nil {
+		return 0, 0, err
+	}
+	var deleted int64
+	var failed int64
+	for _, item := range items {
+		if err := os.Remove(item.FilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			_ = s.markDeleteFailed(ctx, item.ID, err)
+			s.permanentDeleteErrors.Add(1)
+			failed++
+			logEvent("error", "permanent_image_file_remove_failed", map[string]any{"id": item.ID, "path": item.FilePath, "error": err.Error()})
+			continue
+		}
+		ok, err := s.markDeleted(ctx, item.ID, item.SizeBytes)
+		if err != nil {
+			return deleted, failed, err
+		}
+		if ok {
+			deleted++
+			s.permanentDeleted.Add(1)
+		}
+	}
+	return deleted, failed, nil
 }
 
 func (s *Server) cleanupLoop() {
@@ -1638,22 +1808,60 @@ func (s *Server) reserveImageForDelete(ctx context.Context, id string) (deleteCa
 	return item, true, nil
 }
 
-func (s *Server) reservePermanentImageForDelete(ctx context.Context, apiKeyID string, deleteHash string) (deleteCandidate, bool, error) {
-	var item deleteCandidate
-	err := s.db.QueryRow(ctx, `update images
-		set status = 'deleting', updated_at = now(), delete_error = ''
-		where delete_token_hash = $1
-			and api_key_id = $2
-			and retention_policy = 'permanent'
-			and status in ('active', 'delete_failed')
-		returning id, file_path, size_bytes`, deleteHash, apiKeyID).Scan(&item.ID, &item.FilePath, &item.SizeBytes)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return deleteCandidate{}, false, nil
-		}
-		return deleteCandidate{}, false, err
+func (s *Server) reserveQueuedPermanentDeletes(ctx context.Context, batchSize int) ([]deleteCandidate, error) {
+	if batchSize <= 0 {
+		batchSize = 100
 	}
-	return item, true, nil
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	retrySeconds := int(s.cfg.PermanentDeleteRetryDelay / time.Second)
+	rows, err := tx.Query(ctx, `select id, file_path, size_bytes
+		from images
+		where retention_policy = 'permanent'
+			and (
+				status = 'delete_queued'
+				or (
+					status = 'delete_failed'
+					and delete_attempts < $2
+					and updated_at < now() - ($3::int * interval '1 second')
+				)
+			)
+		order by updated_at asc, id asc
+		limit $1
+		for update skip locked`, batchSize, s.cfg.PermanentDeleteMaxAttempts, retrySeconds)
+	if err != nil {
+		return nil, err
+	}
+	var items []deleteCandidate
+	for rows.Next() {
+		var item deleteCandidate
+		if err := rows.Scan(&item.ID, &item.FilePath, &item.SizeBytes); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	for _, item := range items {
+		if _, err := tx.Exec(ctx, `update images
+			set status = 'deleting', updated_at = now(), delete_error = ''
+			where id = $1 and status in ('delete_queued', 'delete_failed')`, item.ID); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 func (s *Server) reserveOldestForDelete(ctx context.Context, where string, args []any, batchSize int) ([]deleteCandidate, error) {
@@ -2376,6 +2584,8 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <div class="card"><div class="k">单图上传上限</div><div class="v" data-stat="maxUpload">{{.MaxUpload}}</div></div>
 <div class="card"><div class="k">正在处理的上传</div><div class="v"><span data-stat="uploads.active">{{.ActiveUploads}}</span> / <span data-stat="uploads.maxConcurrent">{{.MaxConcurrentUploads}}</span></div></div>
 <div class="card"><div class="k">等待队列</div><div class="v"><span data-stat="uploads.queued">{{.QueuedUploads}}</span> / <span data-stat="uploads.maxQueued">{{.MaxQueuedUploads}}</span></div></div>
+<div class="card"><div class="k">永久删除队列</div><div class="v"><span data-stat="permanentDeletes.queued">{{.PermanentDeleteStats.Queued}}</span> / <span data-stat="permanentDeletes.deleting">{{.PermanentDeleteStats.Deleting}}</span></div></div>
+<div class="card"><div class="k">永久删除失败</div><div class="v"><span data-stat="permanentDeletes.failed">{{.PermanentDeleteStats.Failed}}</span></div></div>
 <div class="card"><div class="k">速率限制</div><div class="v" style="font-size:15px;line-height:1.7">Key <span data-stat="uploads.rateLimitKey">{{.RateLimitKey}}</span><br>IP <span data-stat="uploads.rateLimitIP">{{.RateLimitIP}}</span></div></div>
 </section>
 <section class="card">
@@ -2472,6 +2682,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <p>删除永久图片：</p>
 <pre>curl -X DELETE {{.PublicBaseURL}}/api/permanent-images/你的_deleteId \
   -H "Authorization: Bearer 你的_API_KEY"</pre>
+<p>删除接口会先进入数据库队列并返回 <code>accepted</code>，后台 worker 会限速删除真实文件；重复请求同一个 <code>deleteId</code> 是安全的。</p>
 <p class="muted">给 AI 使用时，直接取返回里的 <code>data.url</code> 作为参考图地址。</p>
 </section>
 {{end}}
@@ -2517,7 +2728,7 @@ async function refreshDashboardCards() {
     if (!response.ok) return;
     const payload = await response.json();
     const data = payload && payload.data ? payload.data : {};
-    ["images", "humanBytes", "apiKeyCount", "maxUpload", "uploads.active", "uploads.maxConcurrent", "uploads.queued", "uploads.maxQueued", "uploads.rateLimitKey", "uploads.rateLimitIP"].forEach(function(path) {
+    ["images", "humanBytes", "apiKeyCount", "maxUpload", "uploads.active", "uploads.maxConcurrent", "uploads.queued", "uploads.maxQueued", "uploads.rateLimitKey", "uploads.rateLimitIP", "permanentDeletes.queued", "permanentDeletes.deleting", "permanentDeletes.failed"].forEach(function(path) {
       setDashboardStat(path, readPath(data, path));
     });
   } catch (_) {}
