@@ -14,6 +14,8 @@ It is designed for this flow:
 
 - `POST /api/upload` multipart upload with API key auth.
 - Streaming upload, no base64 payloads.
+- API keys can default uploads to timed cleanup or permanent retention.
+- Permanent uploads return a one-time `deleteId`; callers can delete the image later with the same API key.
 - Local disk storage with date-based paths.
 - PostgreSQL metadata and fast aggregate stats.
 - Admin pages with overview, image search, single image deletion, API key
@@ -53,10 +55,19 @@ Response:
     "id": "...",
     "publicPath": "/i/2026/07/05/....png",
     "url": "https://tc.zmoapi.cn/i/2026/07/05/....png",
+    "deleteId": "pimg_...",
+    "retentionPolicy": "permanent",
     "sizeBytes": 12345
   },
   "msg": "ok"
 }
+```
+
+Delete a permanent image by the returned id:
+
+```bash
+curl -X DELETE http://localhost:8080/api/permanent-images/pimg_... \
+  -H "Authorization: Bearer change-this-upload-key"
 ```
 
 ## Environment

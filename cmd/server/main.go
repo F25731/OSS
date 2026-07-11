@@ -43,7 +43,7 @@ type Config struct {
 	MaxUploadBytes                 int64
 	MaxConcurrentUploads           int
 	MaxQueuedUploads               int
-	UploadQueueTimeout            time.Duration
+	UploadQueueTimeout             time.Duration
 	UploadRateLimitPerKeyPerMinute int
 	UploadRateLimitPerIPPerMinute  int
 	UploadLogQueueSize             int
@@ -56,26 +56,26 @@ type Config struct {
 }
 
 type Server struct {
-	cfg              Config
-	db               *pgxpool.Pool
-	cleanupRuns      atomic.Int64
-	cleanupErrors    atomic.Int64
-	cleanupActive    atomic.Bool
-	statsFlushActive atomic.Bool
-	apiKeyLastUsed   sync.Map
-	uploadSlots      chan struct{}
-	uploadQueue      chan struct{}
-	activeUploads    atomic.Int64
-	queuedUploads    atomic.Int64
-	totalUploads     atomic.Int64
-	failedUploads    atomic.Int64
+	cfg                Config
+	db                 *pgxpool.Pool
+	cleanupRuns        atomic.Int64
+	cleanupErrors      atomic.Int64
+	cleanupActive      atomic.Bool
+	statsFlushActive   atomic.Bool
+	apiKeyLastUsed     sync.Map
+	uploadSlots        chan struct{}
+	uploadQueue        chan struct{}
+	activeUploads      atomic.Int64
+	queuedUploads      atomic.Int64
+	totalUploads       atomic.Int64
+	failedUploads      atomic.Int64
 	rateLimitedUploads atomic.Int64
-	rateMu           sync.Mutex
-	rateWindows      map[string]rateWindow
-	uploadLogQueue   chan UploadLog
-	droppedUploadLogs atomic.Int64
-	loginMu          sync.Mutex
-	loginAttempts    map[string]loginAttempt
+	rateMu             sync.Mutex
+	rateWindows        map[string]rateWindow
+	uploadLogQueue     chan UploadLog
+	droppedUploadLogs  atomic.Int64
+	loginMu            sync.Mutex
+	loginAttempts      map[string]loginAttempt
 }
 
 type rateWindow struct {
@@ -90,27 +90,31 @@ type loginAttempt struct {
 }
 
 type ImageRecord struct {
-	ID           string    `json:"id"`
-	PublicPath   string    `json:"publicPath"`
-	URL          string    `json:"url"`
-	FilePath     string    `json:"-"`
-	OriginalName string    `json:"originalName"`
-	SizeBytes    int64     `json:"sizeBytes"`
-	MimeType     string    `json:"mimeType"`
-	SHA256       string    `json:"sha256"`
-	APIKeyID     string    `json:"apiKeyId,omitempty"`
-	APIKeyName   string    `json:"apiKeyName"`
-	CreatedAt    time.Time `json:"createdAt"`
+	ID                string    `json:"id"`
+	PublicPath        string    `json:"publicPath"`
+	URL               string    `json:"url"`
+	DeleteID          string    `json:"deleteId,omitempty"`
+	FilePath          string    `json:"-"`
+	OriginalName      string    `json:"originalName"`
+	SizeBytes         int64     `json:"sizeBytes"`
+	MimeType          string    `json:"mimeType"`
+	SHA256            string    `json:"sha256"`
+	APIKeyID          string    `json:"apiKeyId,omitempty"`
+	APIKeyName        string    `json:"apiKeyName"`
+	RetentionPolicy   string    `json:"retentionPolicy"`
+	DeleteTokenPrefix string    `json:"deleteIdPrefix,omitempty"`
+	CreatedAt         time.Time `json:"createdAt"`
 }
 
 type APIKey struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	KeyHash   string    `json:"-"`
-	Prefix    string    `json:"prefix"`
-	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"createdAt"`
-	LastUsedAt time.Time `json:"lastUsedAt,omitempty"`
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	KeyHash         string    `json:"-"`
+	Prefix          string    `json:"prefix"`
+	Enabled         bool      `json:"enabled"`
+	RetentionPolicy string    `json:"retentionPolicy"`
+	CreatedAt       time.Time `json:"createdAt"`
+	LastUsedAt      time.Time `json:"lastUsedAt,omitempty"`
 }
 
 type UploadLog struct {
@@ -120,38 +124,45 @@ type UploadLog struct {
 	APIKeyName   string    `json:"apiKeyName"`
 	OriginalName string    `json:"originalName"`
 	SizeBytes    int64     `json:"sizeBytes"`
-	MimeType      string    `json:"mimeType"`
-	IP            string    `json:"ip"`
-	UserAgent     string    `json:"userAgent"`
-	Status        string    `json:"status"`
-	Message       string    `json:"message"`
-	CreatedAt     time.Time `json:"createdAt"`
+	MimeType     string    `json:"mimeType"`
+	IP           string    `json:"ip"`
+	UserAgent    string    `json:"userAgent"`
+	Status       string    `json:"status"`
+	Message      string    `json:"message"`
+	CreatedAt    time.Time `json:"createdAt"`
 }
 
 type UploadPrincipal struct {
-	ID   string
-	Name string
+	ID              string
+	Name            string
+	RetentionPolicy string
 }
 
 type ImageFilter struct {
-	Query string
-	From  string
-	To    string
-	KeyID string
+	Query           string
+	From            string
+	To              string
+	KeyID           string
+	RetentionPolicy string
 }
 
 const adminPageSize = 20
 
+const (
+	retentionTimed     = "timed"
+	retentionPermanent = "permanent"
+)
+
 type Pagination struct {
-	Page       int
-	PageSize   int
-	PrevPage   int
-	NextPage   int
-	HasPrev    bool
-	HasNext    bool
-	FirstURL   string
-	PrevURL    string
-	NextURL    string
+	Page     int
+	PageSize int
+	PrevPage int
+	NextPage int
+	HasPrev  bool
+	HasNext  bool
+	FirstURL string
+	PrevURL  string
+	NextURL  string
 }
 
 type Stats struct {
@@ -160,19 +171,19 @@ type Stats struct {
 }
 
 type Settings struct {
-	RetentionDays          int
-	CapacityGB             int
-	TrimGB                 int
-	CleanupIntervalMinutes int
-	CleanupBatchSize       int
-	LogRetentionDays       int
+	RetentionDays              int
+	CapacityGB                 int
+	TrimGB                     int
+	CleanupIntervalMinutes     int
+	CleanupBatchSize           int
+	LogRetentionDays           int
 	DeletedRecordRetentionDays int
 }
 
 type JSONResponse struct {
-	Code int         `json:"code"`
-	Data any         `json:"data"`
-	Msg  string      `json:"msg"`
+	Code int    `json:"code"`
+	Data any    `json:"data"`
+	Msg  string `json:"msg"`
 }
 
 func main() {
@@ -229,12 +240,12 @@ func main() {
 func loadConfig() Config {
 	maxMB := envInt("MAX_UPLOAD_MB", 50)
 	return Config{
-		ListenAddr:       env("LISTEN_ADDR", ":8080"),
-		DatabaseURL:      env("DATABASE_URL", "postgres://imagebed:imagebed@localhost:5432/imagebed?sslmode=disable"),
-		DBMaxConns:       int32(envInt("DB_MAX_CONNS", max(50, runtime.NumCPU()*4))),
-		StorageDir:       filepath.Clean(env("STORAGE_DIR", "./data/images")),
-		PublicBaseURL:    strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
-		MaxUploadBytes:   int64(maxMB) * 1024 * 1024,
+		ListenAddr:                     env("LISTEN_ADDR", ":8080"),
+		DatabaseURL:                    env("DATABASE_URL", "postgres://imagebed:imagebed@localhost:5432/imagebed?sslmode=disable"),
+		DBMaxConns:                     int32(envInt("DB_MAX_CONNS", max(50, runtime.NumCPU()*4))),
+		StorageDir:                     filepath.Clean(env("STORAGE_DIR", "./data/images")),
+		PublicBaseURL:                  strings.TrimRight(env("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
+		MaxUploadBytes:                 int64(maxMB) * 1024 * 1024,
 		MaxConcurrentUploads:           envInt("MAX_CONCURRENT_UPLOADS", max(8, runtime.NumCPU()*4)),
 		MaxQueuedUploads:               envIntAllowZero("MAX_QUEUED_UPLOADS", max(32, runtime.NumCPU()*8)),
 		UploadQueueTimeout:             time.Duration(envIntAllowZero("UPLOAD_QUEUE_TIMEOUT_SECONDS", 30)) * time.Second,
@@ -242,11 +253,11 @@ func loadConfig() Config {
 		UploadRateLimitPerIPPerMinute:  envIntAllowZero("UPLOAD_RATE_LIMIT_PER_IP_PER_MINUTE", 0),
 		UploadLogQueueSize:             envInt("UPLOAD_LOG_QUEUE_SIZE", 4096),
 		SuccessUploadLogSamplePercent:  clampInt(envIntAllowZero("SUCCESS_UPLOAD_LOG_SAMPLE_PERCENT", 100), 0, 100),
-		AdminUser:        env("ADMIN_USER", "Fyanxv"),
-		AdminPassword:    env("ADMIN_PASSWORD", "Fyb2530+"),
-		SessionSecret:    env("SESSION_SECRET", randomHex(32)),
-		UploadKeys:       parseUploadKeys(env("UPLOAD_API_KEYS", "dev-key")),
-		CORSAllowOrigins: splitCSV(env("CORS_ALLOW_ORIGINS", "")),
+		AdminUser:                      env("ADMIN_USER", "Fyanxv"),
+		AdminPassword:                  env("ADMIN_PASSWORD", "Fyb2530+"),
+		SessionSecret:                  env("SESSION_SECRET", randomHex(32)),
+		UploadKeys:                     parseUploadKeys(env("UPLOAD_API_KEYS", "dev-key")),
+		CORSAllowOrigins:               splitCSV(env("CORS_ALLOW_ORIGINS", "")),
 	}
 }
 
@@ -259,6 +270,10 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /favicon.ico", serveEmbeddedSVG("public/zm.svg"))
 	mux.HandleFunc("POST /api/upload", s.withCORS(s.handleUpload))
 	mux.HandleFunc("OPTIONS /api/upload", s.withCORS(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	mux.HandleFunc("DELETE /api/permanent-images/{deleteID}", s.withCORS(s.handlePermanentImageAPIDelete))
+	mux.HandleFunc("POST /api/permanent-images/delete", s.withCORS(s.handlePermanentImageAPIDelete))
+	mux.HandleFunc("OPTIONS /api/permanent-images/{deleteID}", s.withCORS(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	mux.HandleFunc("OPTIONS /api/permanent-images/delete", s.withCORS(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) }))
 	mux.HandleFunc("GET /api/status", s.requireAdmin(s.handleAPIStatus))
 	mux.HandleFunc("GET /api/metrics", s.requireAdmin(s.handleMetrics))
 	mux.HandleFunc("GET /fyanxv/login", s.handleLoginPage)
@@ -267,6 +282,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /fyanxv", s.requireAdmin(s.handleAdmin))
 	mux.HandleFunc("GET /fyanxv/images", s.requireAdmin(s.handleImages))
 	mux.HandleFunc("POST /fyanxv/images/delete", s.requireAdmin(s.handleImageDelete))
+	mux.HandleFunc("GET /fyanxv/permanent-images", s.requireAdmin(s.handlePermanentImages))
+	mux.HandleFunc("POST /fyanxv/permanent-images/delete", s.requireAdmin(s.handlePermanentImageDelete))
 	mux.HandleFunc("GET /fyanxv/api-keys", s.requireAdmin(s.handleAPIKeys))
 	mux.HandleFunc("POST /fyanxv/api-keys", s.requireAdmin(s.handleAPIKeyCreate))
 	mux.HandleFunc("POST /fyanxv/api-keys/toggle", s.requireAdmin(s.handleAPIKeyToggle))
@@ -465,6 +482,46 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, 0, uploaded, "ok")
 }
 
+func (s *Server) handlePermanentImageAPIDelete(w http.ResponseWriter, r *http.Request) {
+	principal, ok := s.checkUploadAuth(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, 1, nil, "missing or invalid upload api key")
+		return
+	}
+	deleteID := strings.TrimSpace(r.PathValue("deleteID"))
+	if deleteID == "" && r.Method == http.MethodPost {
+		contentType := strings.ToLower(r.Header.Get("Content-Type"))
+		if strings.Contains(contentType, "application/json") {
+			var body struct {
+				DeleteID string `json:"deleteId"`
+			}
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err == nil {
+				deleteID = strings.TrimSpace(body.DeleteID)
+			}
+		} else {
+			_ = r.ParseForm()
+			deleteID = strings.TrimSpace(r.FormValue("delete_id"))
+			if deleteID == "" {
+				deleteID = strings.TrimSpace(r.FormValue("deleteId"))
+			}
+		}
+	}
+	if deleteID == "" {
+		writeJSON(w, http.StatusBadRequest, 1, nil, "deleteId is required")
+		return
+	}
+	deleted, err := s.deletePermanentImageByDeleteID(r.Context(), principal, deleteID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, 1, nil, err.Error())
+		return
+	}
+	if !deleted {
+		writeJSON(w, http.StatusNotFound, 1, nil, "permanent image not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, 0, map[string]any{"deleted": true}, "ok")
+}
+
 func (s *Server) allowUploadRate(principal UploadPrincipal, ip string) (string, bool) {
 	if s.cfg.UploadRateLimitPerIPPerMinute > 0 && !s.allowRate("ip:"+ip, s.cfg.UploadRateLimitPerIPPerMinute, time.Minute) {
 		return "upload rate limit exceeded for ip", false
@@ -547,6 +604,15 @@ func (s *Server) releaseUploadSlot() {
 
 func (s *Server) saveMultipartImage(ctx context.Context, part *multipart.Part, principal UploadPrincipal) (*ImageRecord, error) {
 	id := randomHex(16)
+	deleteID := ""
+	deleteHash := ""
+	deletePrefix := ""
+	retentionPolicy := normalizeRetentionPolicy(principal.RetentionPolicy)
+	if retentionPolicy == retentionPermanent {
+		deleteID = "pimg_" + randomHex(24)
+		deleteHash = hashAPIKey(deleteID)
+		deletePrefix = keyPrefix(deleteID)
+	}
 	now := time.Now().UTC()
 	dateDir := filepath.Join(fmt.Sprintf("%04d", now.Year()), fmt.Sprintf("%02d", int(now.Month())), fmt.Sprintf("%02d", now.Day()))
 	tmpDir := filepath.Join(s.cfg.StorageDir, "_tmp")
@@ -611,26 +677,29 @@ func (s *Server) saveMultipartImage(ctx context.Context, part *multipart.Part, p
 
 	publicPath := "/i/" + strings.ReplaceAll(filepath.ToSlash(filepath.Join(dateDir, fileName)), "//", "/")
 	record := &ImageRecord{
-		ID:           id,
-		PublicPath:   publicPath,
-		URL:          s.cfg.PublicBaseURL + publicPath,
-		FilePath:     finalPath,
-		OriginalName: part.FileName(),
-		SizeBytes:    size,
-		MimeType:     mimeType,
-		SHA256:       hex.EncodeToString(hash.Sum(nil)),
-		APIKeyID:     principal.ID,
-		APIKeyName:   principal.Name,
-		CreatedAt:    now,
+		ID:                id,
+		PublicPath:        publicPath,
+		URL:               s.cfg.PublicBaseURL + publicPath,
+		FilePath:          finalPath,
+		OriginalName:      part.FileName(),
+		SizeBytes:         size,
+		MimeType:          mimeType,
+		SHA256:            hex.EncodeToString(hash.Sum(nil)),
+		APIKeyID:          principal.ID,
+		APIKeyName:        principal.Name,
+		RetentionPolicy:   retentionPolicy,
+		DeleteID:          deleteID,
+		DeleteTokenPrefix: deletePrefix,
+		CreatedAt:         now,
 	}
-	if err := s.insertImage(ctx, record); err != nil {
+	if err := s.insertImage(ctx, record, deleteHash); err != nil {
 		_ = os.Remove(finalPath)
 		return nil, err
 	}
 	return record, nil
 }
 
-func (s *Server) insertImage(ctx context.Context, img *ImageRecord) error {
+func (s *Server) insertImage(ctx context.Context, img *ImageRecord, deleteHash string) error {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return err
@@ -638,9 +707,9 @@ func (s *Server) insertImage(ctx context.Context, img *ImageRecord) error {
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	_, err = tx.Exec(ctx, `insert into images
-		(id, public_path, file_path, original_name, size_bytes, mime_type, sha256, api_key_id, api_key_name, created_at)
-		values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		img.ID, img.PublicPath, img.FilePath, img.OriginalName, img.SizeBytes, img.MimeType, img.SHA256, img.APIKeyID, img.APIKeyName, img.CreatedAt)
+		(id, public_path, file_path, original_name, size_bytes, mime_type, sha256, api_key_id, api_key_name, retention_policy, delete_token_hash, delete_token_prefix, created_at)
+		values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		img.ID, img.PublicPath, img.FilePath, img.OriginalName, img.SizeBytes, img.MimeType, img.SHA256, img.APIKeyID, img.APIKeyName, img.RetentionPolicy, emptyToNil(deleteHash), img.DeleteTokenPrefix, img.CreatedAt)
 	if err != nil {
 		return err
 	}
@@ -698,20 +767,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	_ = s.db.QueryRow(r.Context(), `select count(*) from storage_events`).Scan(&pendingEvents)
 	writeJSON(w, http.StatusOK, 0, map[string]any{
 		"uploads": map[string]any{
-			"active":                       s.activeUploads.Load(),
-			"maxConcurrent":                s.cfg.MaxConcurrentUploads,
-			"queued":                       s.queuedUploads.Load(),
-			"maxQueued":                    s.cfg.MaxQueuedUploads,
-			"queueTimeoutSeconds":          int(s.cfg.UploadQueueTimeout / time.Second),
-			"successTotal":                 s.totalUploads.Load(),
-			"failedTotal":                  s.failedUploads.Load(),
-			"rateLimitedTotal":             s.rateLimitedUploads.Load(),
+			"active":                   s.activeUploads.Load(),
+			"maxConcurrent":            s.cfg.MaxConcurrentUploads,
+			"queued":                   s.queuedUploads.Load(),
+			"maxQueued":                s.cfg.MaxQueuedUploads,
+			"queueTimeoutSeconds":      int(s.cfg.UploadQueueTimeout / time.Second),
+			"successTotal":             s.totalUploads.Load(),
+			"failedTotal":              s.failedUploads.Load(),
+			"rateLimitedTotal":         s.rateLimitedUploads.Load(),
 			"rateLimitPerKeyPerMinute": s.cfg.UploadRateLimitPerKeyPerMinute,
 			"rateLimitPerIPPerMinute":  s.cfg.UploadRateLimitPerIPPerMinute,
-			"logQueueLength":               len(s.uploadLogQueue),
-			"logQueueCapacity":             cap(s.uploadLogQueue),
-			"droppedLogTotal":              s.droppedUploadLogs.Load(),
-			"successLogSamplePercent":      s.cfg.SuccessUploadLogSamplePercent,
+			"logQueueLength":           len(s.uploadLogQueue),
+			"logQueueCapacity":         cap(s.uploadLogQueue),
+			"droppedLogTotal":          s.droppedUploadLogs.Load(),
+			"successLogSamplePercent":  s.cfg.SuccessUploadLogSamplePercent,
 		},
 		"cleanup": map[string]any{
 			"runs":   s.cleanupRuns.Load(),
@@ -722,22 +791,22 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			"pending": pendingEvents,
 		},
 		"database": map[string]any{
-			"acquireCount":        dbStats.AcquireCount(),
-			"acquireDuration":     dbStats.AcquireDuration().String(),
-			"acquiredConns":       dbStats.AcquiredConns(),
+			"acquireCount":         dbStats.AcquireCount(),
+			"acquireDuration":      dbStats.AcquireDuration().String(),
+			"acquiredConns":        dbStats.AcquiredConns(),
 			"canceledAcquireCount": dbStats.CanceledAcquireCount(),
-			"constructingConns":   dbStats.ConstructingConns(),
-			"emptyAcquireCount":   dbStats.EmptyAcquireCount(),
-			"idleConns":           dbStats.IdleConns(),
-			"maxConns":            dbStats.MaxConns(),
-			"totalConns":          dbStats.TotalConns(),
+			"constructingConns":    dbStats.ConstructingConns(),
+			"emptyAcquireCount":    dbStats.EmptyAcquireCount(),
+			"idleConns":            dbStats.IdleConns(),
+			"maxConns":             dbStats.MaxConns(),
+			"totalConns":           dbStats.TotalConns(),
 		},
 		"memory": map[string]any{
-			"allocBytes":      mem.Alloc,
-			"heapAllocBytes":  mem.HeapAlloc,
-			"heapInuseBytes":  mem.HeapInuse,
-			"numGC":           mem.NumGC,
-			"goroutines":      runtime.NumGoroutine(),
+			"allocBytes":     mem.Alloc,
+			"heapAllocBytes": mem.HeapAlloc,
+			"heapInuseBytes": mem.HeapInuse,
+			"numGC":          mem.NumGC,
+			"goroutines":     runtime.NumGoroutine(),
 		},
 	}, "ok")
 }
@@ -831,30 +900,39 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.renderAdmin(w, r, "overview", map[string]any{
-		"Stats":         stats,
-		"Recent":        recent,
-		"TotalHuman":    formatBytes(stats.TotalBytes),
-		"MaxUpload":     formatBytes(s.cfg.MaxUploadBytes),
-		"ActiveUploads": s.activeUploads.Load(),
+		"Stats":                stats,
+		"Recent":               recent,
+		"TotalHuman":           formatBytes(stats.TotalBytes),
+		"MaxUpload":            formatBytes(s.cfg.MaxUploadBytes),
+		"ActiveUploads":        s.activeUploads.Load(),
 		"MaxConcurrentUploads": s.cfg.MaxConcurrentUploads,
 		"QueuedUploads":        s.queuedUploads.Load(),
 		"MaxQueuedUploads":     s.cfg.MaxQueuedUploads,
 		"UploadQueueTimeout":   int(s.cfg.UploadQueueTimeout / time.Second),
-		"RateLimitKey": formatRateLimit(s.cfg.UploadRateLimitPerKeyPerMinute),
-		"RateLimitIP":  formatRateLimit(s.cfg.UploadRateLimitPerIPPerMinute),
-		"PublicBaseURL": s.cfg.PublicBaseURL,
-		"CleanupRuns":   s.cleanupRuns.Load(),
-		"CleanupErrors": s.cleanupErrors.Load(),
-		"APIKeyCount":   len(keys),
+		"RateLimitKey":         formatRateLimit(s.cfg.UploadRateLimitPerKeyPerMinute),
+		"RateLimitIP":          formatRateLimit(s.cfg.UploadRateLimitPerIPPerMinute),
+		"PublicBaseURL":        s.cfg.PublicBaseURL,
+		"CleanupRuns":          s.cleanupRuns.Load(),
+		"CleanupErrors":        s.cleanupErrors.Load(),
+		"APIKeyCount":          len(keys),
 	})
 }
 
 func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
+	s.handleImagesByPolicy(w, r, retentionTimed, "images")
+}
+
+func (s *Server) handlePermanentImages(w http.ResponseWriter, r *http.Request) {
+	s.handleImagesByPolicy(w, r, retentionPermanent, "permanent_images")
+}
+
+func (s *Server) handleImagesByPolicy(w http.ResponseWriter, r *http.Request, retentionPolicy string, page string) {
 	filter := ImageFilter{
-		Query: r.URL.Query().Get("q"),
-		From:  r.URL.Query().Get("from"),
-		To:    r.URL.Query().Get("to"),
-		KeyID: r.URL.Query().Get("key_id"),
+		Query:           r.URL.Query().Get("q"),
+		From:            r.URL.Query().Get("from"),
+		To:              r.URL.Query().Get("to"),
+		KeyID:           r.URL.Query().Get("key_id"),
+		RetentionPolicy: normalizeRetentionPolicy(retentionPolicy),
 	}
 	images, err := s.searchImages(r.Context(), filter, adminPageSize+1, r.URL.Query().Get("cursor"))
 	if err != nil {
@@ -873,7 +951,7 @@ func (s *Server) handleImages(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.renderAdmin(w, r, "images", map[string]any{"Images": images, "Filter": filter, "Keys": keys, "Pagination": pagination})
+	s.renderAdmin(w, r, page, map[string]any{"Images": images, "Filter": filter, "Keys": keys, "Pagination": pagination})
 }
 
 func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
@@ -891,6 +969,23 @@ func (s *Server) handleImageDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/fyanxv/images", http.StatusFound)
+}
+
+func (s *Server) handlePermanentImageDelete(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "表单无效", http.StatusBadRequest)
+		return
+	}
+	id := strings.TrimSpace(r.FormValue("id"))
+	if id == "" {
+		http.Error(w, "缺少图片 ID", http.StatusBadRequest)
+		return
+	}
+	if err := s.deleteImageByID(r.Context(), id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/fyanxv/permanent-images", http.StatusFound)
 }
 
 func (s *Server) handleAPIKeys(w http.ResponseWriter, r *http.Request) {
@@ -914,9 +1009,10 @@ func (s *Server) handleAPIKeyCreate(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = "未命名密钥"
 	}
+	retentionPolicy := normalizeRetentionPolicy(r.FormValue("retention_policy"))
 	raw := "ib_" + randomHex(24)
 	id := "key_" + randomHex(8)
-	_, err := s.db.Exec(r.Context(), `insert into api_keys (id, name, key_hash, prefix, enabled) values ($1,$2,$3,$4,true)`, id, name, hashAPIKey(raw), keyPrefix(raw))
+	_, err := s.db.Exec(r.Context(), `insert into api_keys (id, name, key_hash, prefix, enabled, retention_policy) values ($1,$2,$3,$4,true,$5)`, id, name, hashAPIKey(raw), keyPrefix(raw), retentionPolicy)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -985,9 +1081,9 @@ func (s *Server) handleDocs(w http.ResponseWriter, r *http.Request) {
 	}
 	s.renderAdmin(w, r, "docs", map[string]any{
 		"PublicBaseURL": s.cfg.PublicBaseURL,
-		"Keys": keys,
-		"RateLimitKey": formatRateLimit(s.cfg.UploadRateLimitPerKeyPerMinute),
-		"RateLimitIP":  formatRateLimit(s.cfg.UploadRateLimitPerIPPerMinute),
+		"Keys":          keys,
+		"RateLimitKey":  formatRateLimit(s.cfg.UploadRateLimitPerKeyPerMinute),
+		"RateLimitIP":   formatRateLimit(s.cfg.UploadRateLimitPerIPPerMinute),
 	})
 }
 
@@ -1015,12 +1111,12 @@ func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	settings := Settings{
-		RetentionDays:          positiveFormInt(r, "retention_days", 7),
-		CapacityGB:             positiveFormInt(r, "capacity_gb", 100),
-		TrimGB:                 positiveFormInt(r, "trim_gb", 30),
-		CleanupIntervalMinutes: positiveFormInt(r, "cleanup_interval_minutes", 10),
-		CleanupBatchSize:       positiveFormInt(r, "cleanup_batch_size", 1000),
-		LogRetentionDays:       positiveFormInt(r, "log_retention_days", 30),
+		RetentionDays:              positiveFormInt(r, "retention_days", 7),
+		CapacityGB:                 positiveFormInt(r, "capacity_gb", 100),
+		TrimGB:                     positiveFormInt(r, "trim_gb", 30),
+		CleanupIntervalMinutes:     positiveFormInt(r, "cleanup_interval_minutes", 10),
+		CleanupBatchSize:           positiveFormInt(r, "cleanup_batch_size", 1000),
+		LogRetentionDays:           positiveFormInt(r, "log_retention_days", 30),
 		DeletedRecordRetentionDays: positiveFormInt(r, "deleted_record_retention_days", 7),
 	}
 	if err := s.saveSettings(r.Context(), settings); err != nil {
@@ -1133,12 +1229,12 @@ func buildPagination(r *http.Request, page int, pageSize int, hasNext bool) Pagi
 		pageSize = adminPageSize
 	}
 	pagination := Pagination{
-		Page:       max(1, page),
-		PageSize:   pageSize,
-		PrevPage:   max(1, page-1),
-		NextPage:   page + 1,
-		HasPrev:    page > 1,
-		HasNext:    hasNext,
+		Page:     max(1, page),
+		PageSize: pageSize,
+		PrevPage: max(1, page-1),
+		NextPage: page + 1,
+		HasPrev:  page > 1,
+		HasNext:  hasNext,
 	}
 	pagination.FirstURL = pageURL(r, 1)
 	if pagination.HasPrev {
@@ -1210,24 +1306,24 @@ func (s *Server) readSettings(ctx context.Context) (Settings, error) {
 		values[k] = v
 	}
 	return Settings{
-		RetentionDays:          positiveInt(values["retention_days"], 7),
-		CapacityGB:             positiveInt(values["capacity_gb"], 100),
-		TrimGB:                 positiveInt(values["trim_gb"], 30),
-		CleanupIntervalMinutes: positiveInt(values["cleanup_interval_minutes"], 10),
-		CleanupBatchSize:       positiveInt(values["cleanup_batch_size"], 1000),
-		LogRetentionDays:       positiveInt(values["log_retention_days"], 30),
+		RetentionDays:              positiveInt(values["retention_days"], 7),
+		CapacityGB:                 positiveInt(values["capacity_gb"], 100),
+		TrimGB:                     positiveInt(values["trim_gb"], 30),
+		CleanupIntervalMinutes:     positiveInt(values["cleanup_interval_minutes"], 10),
+		CleanupBatchSize:           positiveInt(values["cleanup_batch_size"], 1000),
+		LogRetentionDays:           positiveInt(values["log_retention_days"], 30),
 		DeletedRecordRetentionDays: positiveInt(values["deleted_record_retention_days"], 7),
 	}, rows.Err()
 }
 
 func (s *Server) saveSettings(ctx context.Context, settings Settings) error {
 	values := map[string]int{
-		"retention_days":           settings.RetentionDays,
-		"capacity_gb":              settings.CapacityGB,
-		"trim_gb":                  settings.TrimGB,
-		"cleanup_interval_minutes": settings.CleanupIntervalMinutes,
-		"cleanup_batch_size":       settings.CleanupBatchSize,
-		"log_retention_days":       settings.LogRetentionDays,
+		"retention_days":                settings.RetentionDays,
+		"capacity_gb":                   settings.CapacityGB,
+		"trim_gb":                       settings.TrimGB,
+		"cleanup_interval_minutes":      settings.CleanupIntervalMinutes,
+		"cleanup_batch_size":            settings.CleanupBatchSize,
+		"log_retention_days":            settings.LogRetentionDays,
 		"deleted_record_retention_days": settings.DeletedRecordRetentionDays,
 	}
 	for key, value := range values {
@@ -1239,7 +1335,7 @@ func (s *Server) saveSettings(ctx context.Context, settings Settings) error {
 }
 
 func (s *Server) recentImages(ctx context.Context, limit int) ([]ImageRecord, error) {
-	rows, err := s.db.Query(ctx, `select id, public_path, file_path, original_name, size_bytes, mime_type, sha256, coalesce(api_key_id, ''), api_key_name, created_at
+	rows, err := s.db.Query(ctx, `select id, public_path, file_path, original_name, size_bytes, mime_type, sha256, coalesce(api_key_id, ''), api_key_name, retention_policy, delete_token_prefix, created_at
 		from images where status in ('active', 'delete_failed') order by created_at desc limit $1`, limit)
 	if err != nil {
 		return nil, err
@@ -1248,9 +1344,10 @@ func (s *Server) recentImages(ctx context.Context, limit int) ([]ImageRecord, er
 	var items []ImageRecord
 	for rows.Next() {
 		var item ImageRecord
-		if err := rows.Scan(&item.ID, &item.PublicPath, &item.FilePath, &item.OriginalName, &item.SizeBytes, &item.MimeType, &item.SHA256, &item.APIKeyID, &item.APIKeyName, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.PublicPath, &item.FilePath, &item.OriginalName, &item.SizeBytes, &item.MimeType, &item.SHA256, &item.APIKeyID, &item.APIKeyName, &item.RetentionPolicy, &item.DeleteTokenPrefix, &item.CreatedAt); err != nil {
 			return nil, err
 		}
+		item.RetentionPolicy = normalizeRetentionPolicy(item.RetentionPolicy)
 		item.URL = s.cfg.PublicBaseURL + item.PublicPath
 		items = append(items, item)
 	}
@@ -1260,6 +1357,11 @@ func (s *Server) recentImages(ctx context.Context, limit int) ([]ImageRecord, er
 func (s *Server) imageFilterWhere(filter ImageFilter) ([]string, []any) {
 	where := []string{"status in ('active', 'delete_failed')"}
 	args := []any{}
+	if strings.TrimSpace(filter.RetentionPolicy) != "" {
+		retentionPolicy := normalizeRetentionPolicy(filter.RetentionPolicy)
+		args = append(args, retentionPolicy)
+		where = append(where, fmt.Sprintf("retention_policy = $%d", len(args)))
+	}
 	if q := strings.TrimSpace(filter.Query); q != "" {
 		args = append(args, "%"+q+"%")
 		where = append(where, fmt.Sprintf("(original_name ilike $%d or id ilike $%d or sha256 ilike $%d)", len(args), len(args), len(args)))
@@ -1291,7 +1393,7 @@ func (s *Server) searchImages(ctx context.Context, filter ImageFilter, limit int
 	}
 	args = append(args, limit)
 	limitArg := len(args)
-	query := fmt.Sprintf(`select id, public_path, file_path, original_name, size_bytes, mime_type, sha256, coalesce(api_key_id, ''), api_key_name, created_at
+	query := fmt.Sprintf(`select id, public_path, file_path, original_name, size_bytes, mime_type, sha256, coalesce(api_key_id, ''), api_key_name, retention_policy, delete_token_prefix, created_at
 		from images where %s order by created_at desc, id desc limit $%d`, strings.Join(where, " and "), limitArg)
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
@@ -1301,9 +1403,10 @@ func (s *Server) searchImages(ctx context.Context, filter ImageFilter, limit int
 	var items []ImageRecord
 	for rows.Next() {
 		var item ImageRecord
-		if err := rows.Scan(&item.ID, &item.PublicPath, &item.FilePath, &item.OriginalName, &item.SizeBytes, &item.MimeType, &item.SHA256, &item.APIKeyID, &item.APIKeyName, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.PublicPath, &item.FilePath, &item.OriginalName, &item.SizeBytes, &item.MimeType, &item.SHA256, &item.APIKeyID, &item.APIKeyName, &item.RetentionPolicy, &item.DeleteTokenPrefix, &item.CreatedAt); err != nil {
 			return nil, err
 		}
+		item.RetentionPolicy = normalizeRetentionPolicy(item.RetentionPolicy)
 		item.URL = s.cfg.PublicBaseURL + item.PublicPath
 		items = append(items, item)
 	}
@@ -1343,6 +1446,22 @@ func (s *Server) deleteImageByID(ctx context.Context, id string) error {
 	}
 	_, err = s.markDeleted(ctx, item.ID, item.SizeBytes)
 	return err
+}
+
+func (s *Server) deletePermanentImageByDeleteID(ctx context.Context, principal UploadPrincipal, deleteID string) (bool, error) {
+	item, ok, err := s.reservePermanentImageForDelete(ctx, principal.ID, hashAPIKey(deleteID))
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	if err := os.Remove(item.FilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		_ = s.markDeleteFailed(ctx, item.ID, err)
+		return false, err
+	}
+	deleted, err := s.markDeleted(ctx, item.ID, item.SizeBytes)
+	return deleted, err
 }
 
 type CleanupResult struct {
@@ -1400,7 +1519,7 @@ func (s *Server) runCleanup(ctx context.Context) (CleanupResult, error) {
 	var total CleanupResult
 	if settings.RetentionDays > 0 {
 		cutoff := time.Now().Add(-time.Duration(settings.RetentionDays) * 24 * time.Hour)
-		result, err := s.deleteOldestWhere(ctx, `created_at < $1`, []any{cutoff}, settings.CleanupBatchSize, 0)
+		result, err := s.deleteOldestWhere(ctx, `retention_policy = 'timed' and created_at < $1`, []any{cutoff}, settings.CleanupBatchSize, 0)
 		if err != nil {
 			return total, err
 		}
@@ -1424,7 +1543,7 @@ func (s *Server) runCleanup(ctx context.Context) (CleanupResult, error) {
 	}
 	if stats.TotalBytes > capacity {
 		needFree := stats.TotalBytes - target
-		result, err := s.deleteOldestWhere(ctx, `true`, nil, settings.CleanupBatchSize, needFree)
+		result, err := s.deleteOldestWhere(ctx, `retention_policy = 'timed'`, nil, settings.CleanupBatchSize, needFree)
 		if err != nil {
 			return total, err
 		}
@@ -1510,6 +1629,24 @@ func (s *Server) reserveImageForDelete(ctx context.Context, id string) (deleteCa
 		set status = 'deleting', updated_at = now(), delete_error = ''
 		where id = $1 and status in ('active', 'delete_failed')
 		returning id, file_path, size_bytes`, id).Scan(&item.ID, &item.FilePath, &item.SizeBytes)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return deleteCandidate{}, false, nil
+		}
+		return deleteCandidate{}, false, err
+	}
+	return item, true, nil
+}
+
+func (s *Server) reservePermanentImageForDelete(ctx context.Context, apiKeyID string, deleteHash string) (deleteCandidate, bool, error) {
+	var item deleteCandidate
+	err := s.db.QueryRow(ctx, `update images
+		set status = 'deleting', updated_at = now(), delete_error = ''
+		where delete_token_hash = $1
+			and api_key_id = $2
+			and retention_policy = 'permanent'
+			and status in ('active', 'delete_failed')
+		returning id, file_path, size_bytes`, deleteHash, apiKeyID).Scan(&item.ID, &item.FilePath, &item.SizeBytes)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return deleteCandidate{}, false, nil
@@ -1625,9 +1762,10 @@ func (s *Server) checkUploadAuth(r *http.Request) (UploadPrincipal, bool) {
 	hash := hashAPIKey(key)
 	var principal UploadPrincipal
 	var enabled bool
-	err := s.db.QueryRow(r.Context(), `select id, name, enabled from api_keys where key_hash = $1`, hash).Scan(&principal.ID, &principal.Name, &enabled)
+	err := s.db.QueryRow(r.Context(), `select id, name, enabled, retention_policy from api_keys where key_hash = $1`, hash).Scan(&principal.ID, &principal.Name, &enabled, &principal.RetentionPolicy)
 	if err == nil {
 		if enabled {
+			principal.RetentionPolicy = normalizeRetentionPolicy(principal.RetentionPolicy)
 			return principal, true
 		}
 		return UploadPrincipal{}, false
@@ -1641,8 +1779,8 @@ func (s *Server) seedEnvAPIKeys(ctx context.Context) error {
 			continue
 		}
 		id := "key_" + randomHex(8)
-		_, err := s.db.Exec(ctx, `insert into api_keys (id, name, key_hash, prefix, enabled)
-			values ($1, $2, $3, $4, true) on conflict (key_hash) do nothing`, id, name, hashAPIKey(key), keyPrefix(key))
+		_, err := s.db.Exec(ctx, `insert into api_keys (id, name, key_hash, prefix, enabled, retention_policy)
+			values ($1, $2, $3, $4, true, $5) on conflict (key_hash) do nothing`, id, name, hashAPIKey(key), keyPrefix(key), retentionTimed)
 		if err != nil {
 			return err
 		}
@@ -1691,7 +1829,7 @@ func (s *Server) uploadLogLoop() {
 }
 
 func (s *Server) listAPIKeys(ctx context.Context) ([]APIKey, error) {
-	rows, err := s.db.Query(ctx, `select id, name, key_hash, prefix, enabled, created_at, coalesce(last_used_at, '0001-01-01 00:00:00+00'::timestamptz) from api_keys order by created_at desc`)
+	rows, err := s.db.Query(ctx, `select id, name, key_hash, prefix, enabled, retention_policy, created_at, coalesce(last_used_at, '0001-01-01 00:00:00+00'::timestamptz) from api_keys order by created_at desc`)
 	if err != nil {
 		return nil, err
 	}
@@ -1699,9 +1837,10 @@ func (s *Server) listAPIKeys(ctx context.Context) ([]APIKey, error) {
 	var items []APIKey
 	for rows.Next() {
 		var item APIKey
-		if err := rows.Scan(&item.ID, &item.Name, &item.KeyHash, &item.Prefix, &item.Enabled, &item.CreatedAt, &item.LastUsedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.Name, &item.KeyHash, &item.Prefix, &item.Enabled, &item.RetentionPolicy, &item.CreatedAt, &item.LastUsedAt); err != nil {
 			return nil, err
 		}
+		item.RetentionPolicy = normalizeRetentionPolicy(item.RetentionPolicy)
 		items = append(items, item)
 	}
 	return items, rows.Err()
@@ -1779,7 +1918,7 @@ func (s *Server) withCORS(next http.HandlerFunc) http.HandlerFunc {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, X-API-Key, Content-Type")
-			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Methods", "POST, DELETE, OPTIONS")
 		}
 		next(w, r)
 	}
@@ -1887,7 +2026,8 @@ func writeJSON(w http.ResponseWriter, status int, code int, data any, msg string
 
 func render(w http.ResponseWriter, raw string, data any) {
 	tpl := template.Must(template.New("page").Funcs(template.FuncMap{
-		"bytes": formatBytes,
+		"bytes":     formatBytes,
+		"retention": formatRetentionPolicy,
 	}).Parse(raw))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := tpl.Execute(w, data); err != nil {
@@ -1902,9 +2042,10 @@ func (s *Server) renderAdmin(w http.ResponseWriter, r *http.Request, page string
 	data["Page"] = page
 	data["CSRF"] = s.csrfToken(r)
 	tpl := template.Must(template.New("admin").Funcs(template.FuncMap{
-		"bytes": formatBytes,
-		"date":  formatTime,
-		"short": shortText,
+		"bytes":     formatBytes,
+		"date":      formatTime,
+		"short":     shortText,
+		"retention": formatRetentionPolicy,
 	}).Parse(adminTemplateV2))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := tpl.Execute(w, data); err != nil {
@@ -2078,6 +2219,20 @@ func formatRateLimit(value int) string {
 	return fmt.Sprintf("%d/分钟", value)
 }
 
+func normalizeRetentionPolicy(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), retentionPermanent) {
+		return retentionPermanent
+	}
+	return retentionTimed
+}
+
+func formatRetentionPolicy(value string) string {
+	if normalizeRetentionPolicy(value) == retentionPermanent {
+		return "永久保存"
+	}
+	return "定时清理"
+}
+
 const loginTemplate = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -2197,7 +2352,8 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <div class="brand"><img src="/assets/zm.svg" width="28" height="28" alt="" aria-hidden="true" decoding="sync" fetchpriority="high"><span>知梦图床</span></div>
 <nav class="nav">
 <a class="{{if eq .Page "overview"}}active{{end}}" href="/fyanxv">概览</a>
-<a class="{{if eq .Page "images"}}active{{end}}" href="/fyanxv/images">图片管理</a>
+<a class="{{if eq .Page "images"}}active{{end}}" href="/fyanxv/images">定时图片</a>
+<a class="{{if eq .Page "permanent_images"}}active{{end}}" href="/fyanxv/permanent-images">永久图片</a>
 <a class="{{if eq .Page "api_keys"}}active{{end}}" href="/fyanxv/api-keys">API 密钥</a>
 <a class="{{if eq .Page "logs"}}active{{end}}" href="/fyanxv/logs">上传日志</a>
 <a class="{{if eq .Page "docs"}}active{{end}}" href="/fyanxv/docs">接入文档</a>
@@ -2206,7 +2362,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 </aside>
 <main class="main">
 <header class="top">
-<h1>{{if eq .Page "overview"}}概览{{else if eq .Page "images"}}图片管理{{else if eq .Page "api_keys"}}API 密钥{{else if eq .Page "logs"}}上传日志{{else if eq .Page "docs"}}接入文档{{else}}系统设置{{end}}</h1>
+<h1>{{if eq .Page "overview"}}概览{{else if eq .Page "images"}}定时图片{{else if eq .Page "permanent_images"}}永久图片{{else if eq .Page "api_keys"}}API 密钥{{else if eq .Page "logs"}}上传日志{{else if eq .Page "docs"}}接入文档{{else}}系统设置{{end}}</h1>
 <form class="inline" method="post" action="/fyanxv/logout"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><button class="secondary">退出登录</button></form>
 </header>
 <section class="content">
@@ -2230,11 +2386,11 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 </section>
 {{end}}
 
-{{if eq .Page "images"}}
-<div class="section-head"><h2>图片管理</h2><button type="button" class="secondary" data-refresh>刷新</button></div>
+{{if or (eq .Page "images") (eq .Page "permanent_images")}}
+<div class="section-head"><h2>{{if eq .Page "permanent_images"}}永久图片{{else}}定时图片{{end}}</h2><button type="button" class="secondary" data-refresh>刷新</button></div>
 <section class="card">
 <h2>搜索筛选</h2>
-<form method="get" action="/fyanxv/images" class="row">
+<form method="get" action="{{if eq .Page "permanent_images"}}/fyanxv/permanent-images{{else}}/fyanxv/images{{end}}" class="row">
 <div><label>关键词</label><input name="q" value="{{.Filter.Query}}" placeholder="文件名、ID、SHA256"></div>
 <div><label>开始日期</label><input type="date" name="from" value="{{.Filter.From}}"></div>
 <div><label>结束日期</label><input type="date" name="to" value="{{.Filter.To}}"></div>
@@ -2244,35 +2400,36 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 </section>
 <section class="card">
 <h2>图片列表</h2>
-<table><thead><tr><th>预览</th><th>文件</th><th>大小</th><th>类型</th><th>密钥</th><th>上传时间</th><th>操作</th></tr></thead><tbody>
+<table><thead><tr><th>预览</th><th>文件</th><th>大小</th><th>类型</th><th>密钥</th><th>保存策略</th><th>上传时间</th><th>操作</th></tr></thead><tbody>
 {{range .Images}}<tr>
 <td><a href="{{.URL}}" target="_blank"><img class="thumb" src="{{.PublicPath}}" alt=""></a></td>
-<td><a href="{{.URL}}" target="_blank">{{.OriginalName}}</a><br><span class="muted">{{.PublicPath}}</span></td>
-<td>{{bytes .SizeBytes}}</td><td>{{.MimeType}}</td><td>{{.APIKeyName}}</td><td>{{date .CreatedAt}}</td>
-<td><form method="post" action="/fyanxv/images/delete" onsubmit="return confirm('确定删除这张图片吗？')"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">删除</button></form></td>
-</tr>{{else}}<tr><td colspan="7">没有找到图片。</td></tr>{{end}}
+<td><a href="{{.URL}}" target="_blank">{{.OriginalName}}</a><br><span class="muted">{{.PublicPath}}</span>{{if .DeleteTokenPrefix}}<br><span class="muted">删除ID前缀：{{.DeleteTokenPrefix}}</span>{{end}}</td>
+<td>{{bytes .SizeBytes}}</td><td>{{.MimeType}}</td><td>{{.APIKeyName}}</td><td>{{retention .RetentionPolicy}}</td><td>{{date .CreatedAt}}</td>
+<td><form method="post" action="{{if eq $.Page "permanent_images"}}/fyanxv/permanent-images/delete{{else}}/fyanxv/images/delete{{end}}" onsubmit="return confirm('确定删除这张图片吗？')"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">删除</button></form></td>
+</tr>{{else}}<tr><td colspan="8">没有找到图片。</td></tr>{{end}}
 </tbody></table>
 </section>
 {{end}}
 
-{{if and (eq .Page "images") .Pagination}}<div class="pager"><span>每页 {{.Pagination.PageSize}} 条</span><a class="btn secondary {{if not .Pagination.HasPrev}}disabled{{end}}" href="{{.Pagination.FirstURL}}">第一页</a><a class="btn secondary {{if not .Pagination.HasNext}}disabled{{end}}" href="{{.Pagination.NextURL}}">下一页</a></div>{{end}}
+{{if and (or (eq .Page "images") (eq .Page "permanent_images")) .Pagination}}<div class="pager"><span>每页 {{.Pagination.PageSize}} 条</span><a class="btn secondary {{if not .Pagination.HasPrev}}disabled{{end}}" href="{{.Pagination.FirstURL}}">第一页</a><a class="btn secondary {{if not .Pagination.HasNext}}disabled{{end}}" href="{{.Pagination.NextURL}}">下一页</a></div>{{end}}
 {{if eq .Page "api_keys"}}
 {{if .CreatedKey}}<div class="alert"><strong>新密钥已生成，只显示这一次：</strong><br><code>{{.CreatedKey}}</code></div>{{end}}
 <section class="card">
 <h2>生成 API 密钥</h2>
 <form method="post" action="/fyanxv/api-keys" class="row">
 <input type="hidden" name="csrf_token" value="{{.CSRF}}">
-<div style="grid-column:span 4"><label>密钥名称</label><input name="name" placeholder="例如：画布上传、测试环境"></div>
+<div style="grid-column:span 3"><label>密钥名称</label><input name="name" placeholder="例如：画布上传、测试环境"></div>
+<div><label>保存策略</label><select name="retention_policy"><option value="timed">定时清理</option><option value="permanent">永久保存</option></select></div>
 <div><button type="submit">生成密钥</button></div>
 </form>
 </section>
 <section class="card">
 <h2>密钥列表</h2>
-<table><thead><tr><th>名称</th><th>前缀</th><th>状态</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead><tbody>
+<table><thead><tr><th>名称</th><th>前缀</th><th>保存策略</th><th>状态</th><th>创建时间</th><th>最后使用</th><th>操作</th></tr></thead><tbody>
 {{range .Keys}}<tr>
-<td>{{.Name}}</td><td><code>{{.Prefix}}</code></td><td>{{if .Enabled}}<span class="tag ok">启用</span>{{else}}<span class="tag bad">停用</span>{{end}}</td><td>{{date .CreatedAt}}</td><td>{{date .LastUsedAt}}</td>
+<td>{{.Name}}</td><td><code>{{.Prefix}}</code></td><td><span class="tag {{if eq .RetentionPolicy "permanent"}}ok{{end}}">{{retention .RetentionPolicy}}</span></td><td>{{if .Enabled}}<span class="tag ok">启用</span>{{else}}<span class="tag bad">停用</span>{{end}}</td><td>{{date .CreatedAt}}</td><td>{{date .LastUsedAt}}</td>
 <td><form class="inline" method="post" action="/fyanxv/api-keys/toggle"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button class="secondary" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form> <form class="inline" method="post" action="/fyanxv/api-keys/delete" onsubmit="return confirm('确定删除这个密钥吗？')"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}"><button class="danger" type="submit">删除</button></form></td>
-</tr>{{else}}<tr><td colspan="6">还没有密钥。</td></tr>{{end}}
+</tr>{{else}}<tr><td colspan="7">还没有密钥。</td></tr>{{end}}
 </tbody></table>
 </section>
 {{end}}
@@ -2294,6 +2451,7 @@ pre{padding:14px;overflow:auto;line-height:1.6}
 <p>接口地址：<code>{{.PublicBaseURL}}/api/upload</code></p>
 <p>请求方式：<code>POST multipart/form-data</code>，文件字段名使用 <code>file</code> 或 <code>image</code>。</p>
 <p>鉴权方式：请求头 <code>Authorization: Bearer 你的_API_KEY</code>，也支持 <code>X-API-Key: 你的_API_KEY</code>。</p>
+<p>API 密钥分为定时清理和永久保存。永久保存密钥上传成功后会额外返回 <code>deleteId</code>，业务系统需要保存它用于后续删除。</p>
 <p>当前上传限速：API Key <code>{{.RateLimitKey}}</code>，IP <code>{{.RateLimitIP}}</code>。</p>
 <pre>curl -X POST {{.PublicBaseURL}}/api/upload \
   -H "Authorization: Bearer 你的_API_KEY" \
@@ -2304,11 +2462,16 @@ pre{padding:14px;overflow:auto;line-height:1.6}
   "data": {
     "url": "{{.PublicBaseURL}}/i/2026/07/05/example.png",
     "publicPath": "/i/2026/07/05/example.png",
+    "deleteId": "pimg_仅永久图片返回",
+    "retentionPolicy": "permanent",
     "sizeBytes": 12345,
     "mimeType": "image/png"
   },
   "msg": "ok"
 }</pre>
+<p>删除永久图片：</p>
+<pre>curl -X DELETE {{.PublicBaseURL}}/api/permanent-images/你的_deleteId \
+  -H "Authorization: Bearer 你的_API_KEY"</pre>
 <p class="muted">给 AI 使用时，直接取返回里的 <code>data.url</code> 作为参考图地址。</p>
 </section>
 {{end}}
